@@ -1,0 +1,13 @@
+node_modules/
+build/
+dist/
+coverage/
+.DS_Store
+*.log
+.env*
+!.env.example
+
+# Local/tooling state
+.vercel
+.claude/settings.local.json
+bench/out/
