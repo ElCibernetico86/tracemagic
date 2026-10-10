@@ -17,4 +17,12 @@ export const LOGOS: Record<string, string> = {
     <path d="M30 240 L120 240 L150 270 L60 270 Z" fill="#7a3e9d"/>
     <rect x="200" y="225" width="170" height="55" rx="27" fill="#e4002b"/>
   </svg>`,
+  lineart: `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 300" width="400" height="300">
+    <rect width="400" height="300" fill="#ffffff"/>
+    <circle cx="90" cy="100" r="55" fill="none" stroke="#111111" stroke-width="1.6"/>
+    <path d="M40 200 L140 200 M40 215 L140 230 M40 245 L140 245" stroke="#111111" stroke-width="2" fill="none"/>
+    <rect x="190" y="50" width="170" height="90" rx="10" fill="none" stroke="#d62828" stroke-width="2.5"/>
+    <text x="275" y="105" font-family="Helvetica, Arial" font-size="18" fill="#003049" text-anchor="middle">PRO FINISHES</text>
+    <text x="275" y="220" font-family="Georgia, serif" font-size="30" font-style="italic" fill="#d62828" text-anchor="middle">The Wall Experts</text>
+  </svg>`,
 };

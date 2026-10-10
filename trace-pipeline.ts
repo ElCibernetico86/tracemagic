@@ -56,9 +56,9 @@ export function parseTraceOptions(body: Record<string, unknown>): TraceOptions {
     ? clamp(Number(body.smoothness), 0, 100)
     : 50;
 
-  const groupByColor = body.groupByColor === 'true' || body.groupByColor === true;
-  // Grouping reorders paths by color; only safe when shapes are cut out and never overlap.
-  const stacking: ShapeStacking = groupByColor || body.stacking === 'cutout' ? 'cutout' : 'stacked';
+  // Default on: every color becomes its own named group in the SVG.
+  const groupByColor = !(body.groupByColor === 'false' || body.groupByColor === false);
+  const stacking: ShapeStacking = body.stacking === 'cutout' ? 'cutout' : 'stacked';
 
   return { mode, maxColors, detail, smoothness, curveMode, stacking, groupByColor };
 }
@@ -71,13 +71,14 @@ function buildVectorizerConfig(options: TraceOptions, scale: number) {
 
   const speckle = 1 + ((100 - options.detail) / 100) * 15;
   return {
-    // B&W is binarized in preprocessing, so VTracer always sees exact colors.
-    colorMode: ColorMode.Color,
+    // Layers are traced one at a time as black-on-white masks (see traceImage).
+    colorMode: ColorMode.Binary,
     colorPrecision: 8,
     filterSpeckle: Math.max(1, Math.round(speckle * scale)),
     spliceThreshold: 45,
     cornerThreshold: 60,
-    hierarchical: options.stacking === 'cutout' ? Hierarchical.Cutout : Hierarchical.Stacked,
+    // Stacking is built from the per-color layer masks, not by VTracer.
+    hierarchical: Hierarchical.Cutout,
     mode: pathSimplifyMode,
     // Inputs are already reduced to an exact palette, so every color is its own layer.
     layerDifference: 1,
@@ -213,71 +214,6 @@ async function preprocessImage(buffer: Buffer, options: TraceOptions) {
   };
 }
 
-/** Snap every path fill to the nearest palette color so the output honors the color limit. */
-function snapSvgToPalette(svg: string, palette: [number, number, number][]) {
-  if (palette.length === 0) return svg;
-  const cache = new Map<string, string>();
-  return svg.replace(/fill="#([0-9a-fA-F]{3}|[0-9a-fA-F]{6})"/g, (full, hex: string) => {
-    const cached = cache.get(hex);
-    if (cached) return cached;
-    const expanded =
-      hex.length === 3 ? hex.split('').map((c) => c + c).join('') : hex;
-    const r = parseInt(expanded.slice(0, 2), 16);
-    const g = parseInt(expanded.slice(2, 4), 16);
-    const b = parseInt(expanded.slice(4, 6), 16);
-    let best = palette[0];
-    let bestDist = Infinity;
-    for (const [pr, pg, pb] of palette) {
-      const dist = (r - pr) ** 2 + (g - pg) ** 2 + (b - pb) ** 2;
-      if (dist < bestDist) {
-        bestDist = dist;
-        best = [pr, pg, pb];
-      }
-    }
-    const toHex = (n: number) => n.toString(16).padStart(2, '0');
-    const replacement = `fill="#${toHex(best[0])}${toHex(best[1])}${toHex(best[2])}"`;
-    cache.set(hex, replacement);
-    return replacement;
-  });
-}
-
-/**
- * Rewrite a flat list of <path> elements into one <g fill="..."> per color.
- * Callers must ensure shapes don't overlap (cutout stacking), since this reorders paths.
- */
-function groupSvgByColor(svg: string) {
-  const openMatch = svg.match(/<svg[^>]*>/);
-  const closeIdx = svg.lastIndexOf('</svg>');
-  if (!openMatch || openMatch.index === undefined || closeIdx === -1) return svg;
-
-  const openTag = openMatch[0];
-  const body = svg.slice(openMatch.index + openTag.length, closeIdx);
-
-  const pathRegex = /<path\b[^>]*?(?:\/>|><\/path>)/g;
-  const paths = body.match(pathRegex) ?? [];
-  const rest = body.replace(pathRegex, '').trim();
-  // Anything besides flat paths means an unexpected structure; leave the SVG untouched.
-  if (paths.length === 0 || rest.length > 0) return svg;
-
-  const groups = new Map<string, string[]>();
-  for (const path of paths) {
-    const fillMatch = path.match(/\sfill="([^"]*)"/);
-    const fill = fillMatch ? fillMatch[1] : '';
-    const cleaned = fillMatch ? path.replace(fillMatch[0], '') : path;
-    const bucket = groups.get(fill);
-    if (bucket) bucket.push(cleaned);
-    else groups.set(fill, [cleaned]);
-  }
-
-  const grouped = [...groups.entries()]
-    .map(([fill, members]) =>
-      fill ? `<g fill="${fill}">${members.join('')}</g>` : members.join(''),
-    )
-    .join('');
-
-  return svg.slice(0, openMatch.index) + openTag + grouped + '</svg>';
-}
-
 function svgStats(svg: string) {
   const paths = (svg.match(/<path[\s>]/g) || []).length;
   const fills = new Set<string>();
@@ -287,79 +223,184 @@ function svgStats(svg: string) {
   return { paths, colors: fills.size, bytes: Buffer.byteLength(svg, 'utf8') };
 }
 
-function normalizeSvg(svg: string) {
-  const trimmed = svg.trim();
-  const start = trimmed.indexOf('<svg');
-  const end = trimmed.lastIndexOf('</svg>');
-
-  if (start === -1 || end === -1) {
-    throw new Error('The vectorizer did not return a valid SVG.');
-  }
-
-  let result = trimmed.slice(start, end + '</svg>'.length);
-
-  // Ensure a viewBox so the SVG scales cleanly in previews and editors.
-  if (!/viewBox=/.test(result)) {
-    const widthMatch = result.match(/<svg[^>]*\swidth="([\d.]+)/);
-    const heightMatch = result.match(/<svg[^>]*\sheight="([\d.]+)/);
-    if (widthMatch && heightMatch) {
-      result = result.replace('<svg', `<svg viewBox="0 0 ${widthMatch[1]} ${heightMatch[1]}"`);
-    }
-  }
-
-  return result;
-}
-
 export interface TraceResult {
   svg: string;
   stats: { paths: number; colors: number; bytes: number; width: number; height: number; durationMs: number };
 }
 
 /** Full raster → SVG pipeline. */
+/**
+ * How far (source px) a stacked layer's hidden extension stays inside the
+ * shapes above it. Larger than the curve-fitting error, so a lower color
+ * never peeks out around the edge of an upper shape.
+ */
+const STACK_INSET = 1.5;
+
+function cutoutLayerMask(labels: Int16Array, rank: Int16Array, r: number): Uint8Array {
+  const mask = new Uint8Array(labels.length);
+  for (let p = 0; p < labels.length; p++) if (labels[p] >= 0 && rank[labels[p]] === r) mask[p] = 1;
+  return mask;
+}
+
+/** Box dilation of a 0/1 mask by `radius` pixels (separable running sums). */
+function dilate(mask: Uint8Array, w: number, h: number, radius: number): Uint8Array {
+  if (radius <= 0) return mask;
+  const tmp = new Uint8Array(w * h);
+  for (let y = 0; y < h; y++) {
+    const row = y * w;
+    let count = 0;
+    for (let x = 0; x <= Math.min(radius, w - 1); x++) count += mask[row + x];
+    for (let x = 0; x < w; x++) {
+      tmp[row + x] = count > 0 ? 1 : 0;
+      const add = x + radius + 1;
+      const drop = x - radius;
+      if (add < w) count += mask[row + add];
+      if (drop >= 0) count -= mask[row + drop];
+    }
+  }
+  const out = new Uint8Array(w * h);
+  for (let x = 0; x < w; x++) {
+    let count = 0;
+    for (let y = 0; y <= Math.min(radius, h - 1); y++) count += tmp[y * w + x];
+    for (let y = 0; y < h; y++) {
+      out[y * w + x] = count > 0 ? 1 : 0;
+      const add = y + radius + 1;
+      const drop = y - radius;
+      if (add < h) count += tmp[add * w + x];
+      if (drop >= 0) count -= tmp[drop * w + x];
+    }
+  }
+  return out;
+}
+
+/**
+ * Stacked layer r: its own pixels, extended under the colors above it — but
+ * only under shapes that touch it, and kept `inset` pixels away from any
+ * lower color so the hidden part can't peek out. E.g. a navy bar with yellow
+ * text becomes a solid bar; unrelated shapes elsewhere aren't copied in.
+ */
+function stackedLayerMask(labels: Int16Array, rank: Int16Array, r: number, w: number, h: number, inset: number) {
+  const n = labels.length;
+  const below = new Uint8Array(n);
+  for (let p = 0; p < n; p++) if (labels[p] < 0 || rank[labels[p]] < r) below[p] = 1;
+  const nearBelow = dilate(below, w, h, inset);
+
+  // Flood from the layer's own pixels through allowed upper pixels (4-connected).
+  const mask = new Uint8Array(n);
+  const stack = new Int32Array(n);
+  let top = 0;
+  for (let p = 0; p < n; p++) {
+    if (labels[p] >= 0 && rank[labels[p]] === r) {
+      mask[p] = 1;
+      stack[top++] = p;
+    }
+  }
+  const allowed = (q: number) => !mask[q] && labels[q] >= 0 && rank[labels[q]] > r && !nearBelow[q];
+  while (top > 0) {
+    const p = stack[--top];
+    const x = p % w;
+    for (const q of [p - w, p + w, x > 0 ? p - 1 : -1, x < w - 1 ? p + 1 : -1]) {
+      if (q >= 0 && q < n && allowed(q)) {
+        mask[q] = 1;
+        stack[top++] = q;
+      }
+    }
+  }
+  return mask;
+}
+
+/** Palette index of every pixel in the exact-color trace image; -1 = transparent. */
+function labelPixels(data: Buffer, palette: RGB[]): Int16Array {
+  const index = new Map<number, number>();
+  palette.forEach(([r, g, b], k) => index.set((r << 16) | (g << 8) | b, k));
+  const labels = new Int16Array(data.length / 4).fill(-1);
+  for (let p = 0; p < labels.length; p++) {
+    const i = p * 4;
+    if (data[i + 3] < 128) continue;
+    labels[p] = index.get((data[i] << 16) | (data[i + 1] << 8) | data[i + 2]) ?? -1;
+  }
+  return labels;
+}
+
+const toHex = ([r, g, b]: RGB) =>
+  [r, g, b].map((v) => v.toString(16).padStart(2, '0')).join('').toUpperCase();
+
+/**
+ * Full raster → SVG pipeline.
+ *
+ * Every palette color is traced as its own layer, bottom (largest area) to
+ * top. In stacked mode a layer also covers the area of every layer above it,
+ * so there are no hairline gaps between colors; in cut-out mode each layer is
+ * exactly its own pixels. Either way the output can be grouped by color
+ * without changing how it looks.
+ */
 export async function traceImage(
   buffer: Buffer,
   options: TraceOptions,
   /** Optional hook to inspect intermediate SVGs (used by bench/). */
-  debug?: (stage: 'raw' | 'refined', svg: string) => void,
+  debug?: (stage: 'raw' | 'refined', svg: string, layer: string) => void,
 ): Promise<TraceResult> {
   const startedAt = Date.now();
   const pre = await preprocessImage(buffer, options);
+  const { traceWidth, traceHeight, palette } = pre;
+  const pixelCount = traceWidth * traceHeight;
+  const labels = labelPixels(pre.data, palette);
 
-  let rawSvg = await vectorizeRaw(
-    pre.data,
-    { width: pre.traceWidth, height: pre.traceHeight },
-    buildVectorizerConfig(options, pre.scale),
-  );
+  const area = new Array<number>(palette.length).fill(0);
+  for (const l of labels) if (l >= 0) area[l]++;
+  const order = palette.map((_, k) => k).filter((k) => area[k] > 0).sort((a, b) => area[b] - area[a]);
+  const rank = new Int16Array(palette.length).fill(-1);
+  order.forEach((k, r) => (rank[k] = r));
 
-  debug?.('raw', rawSvg);
+  const config = buildVectorizerConfig(options, pre.scale);
+  const layers: { hex: string; paths: string[] }[] = [];
 
-  // Geometry pass: bake offsets, scale back to the source size, and (in
-  // curve mode) fit lines, curves, corners and perfect circles.
-  rawSvg = refineTracedSvg(rawSvg, {
-    smoothness: options.smoothness,
-    scale: pre.scale,
-    width: pre.width,
-    height: pre.height,
-    curves: options.curveMode === 'spline',
-    staircase: options.curveMode === 'spline',
-  });
+  for (let r = 0; r < order.length; r++) {
+    const color = palette[order[r]];
+    // Each layer is traced as a black-on-white mask in VTracer's binary mode,
+    // which outputs only the black shapes; the real color is applied below.
+    // (Tracing the layer's colors directly, VTracer sometimes gave the
+    // surrounding region the layer's color, and transparent surroundings
+    // were several times slower.)
+    const mask =
+      options.stacking === 'stacked'
+        ? stackedLayerMask(labels, rank, r, traceWidth, traceHeight, Math.round(STACK_INSET * pre.scale))
+        : cutoutLayerMask(labels, rank, r);
+    const img = Buffer.alloc(pixelCount * 4, 255);
+    for (let p = 0; p < pixelCount; p++) {
+      if (mask[p]) img[p * 4] = img[p * 4 + 1] = img[p * 4 + 2] = 0;
+    }
 
-  debug?.('refined', rawSvg);
+    let svg = await vectorizeRaw(img, { width: traceWidth, height: traceHeight }, config);
+    debug?.('raw', svg, toHex(color));
 
-  if (pre.palette.length > 0) {
-    rawSvg = snapSvgToPalette(rawSvg, pre.palette);
+    // Geometry pass: bake offsets, scale back to the source size, and (in
+    // curve mode) fit lines, curves, corners and perfect circles.
+    svg = refineTracedSvg(svg, {
+      smoothness: options.smoothness,
+      scale: pre.scale,
+      width: pre.width,
+      height: pre.height,
+      curves: options.curveMode === 'spline',
+      staircase: options.curveMode === 'spline',
+    });
+    debug?.('refined', svg, toHex(color));
+
+    svg = await optimize(svg, { preset: OptimizePreset.Safe, multipass: true, multipassIterations: 2 });
+    const paths = (svg.match(/<path\b[^>]*?\/>/g) ?? []).map((path) => path.replace(/\sfill="[^"]*"/, ''));
+    if (paths.length > 0) layers.push({ hex: toHex(color), paths });
   }
 
-  const optimizedSvg = await optimize(rawSvg, {
-    preset: OptimizePreset.Safe,
-    multipass: true,
-    multipassIterations: 2,
-  });
-
-  let svg = normalizeSvg(optimizedSvg || rawSvg);
-  if (options.groupByColor) {
-    svg = groupSvgByColor(svg);
-  }
+  const body = layers
+    .map(({ hex, paths }) =>
+      options.groupByColor
+        ? `<g id="color-${hex}" fill="#${hex}">${paths.join('')}</g>`
+        : paths.map((path) => path.replace('<path', `<path fill="#${hex}"`)).join(''),
+    )
+    .join('');
+  const svg =
+    `<svg xmlns="http://www.w3.org/2000/svg" width="${pre.width}" height="${pre.height}" ` +
+    `viewBox="0 0 ${pre.width} ${pre.height}">${body}</svg>`;
 
   return {
     svg,

@@ -51,7 +51,7 @@ interface TraceStats {
   durationMs: number;
 }
 
-const OUTPUT_DEFAULTS = { stacking: 'stacked' as ShapeStacking, groupByColor: false };
+const OUTPUT_DEFAULTS = { stacking: 'stacked' as ShapeStacking, groupByColor: true };
 
 const PRESETS: Record<PresetId, { label: string; settings: TraceSettings }> = {
   auto: {
@@ -611,7 +611,7 @@ export default function AppPage() {
             {/* SVG output */}
             <div className="pt-5 border-t border-white/10">
               <p className="text-[10px] font-bold text-white/40 uppercase tracking-widest mb-2">Shape Stacking</p>
-              <div className={`flex gap-2 mb-1 ${settings.groupByColor ? 'opacity-30 pointer-events-none' : ''}`}>
+              <div className="flex gap-2 mb-1">
                 <button
                   onClick={() => updateSettings({ stacking: 'stacked' })}
                   className={segmentClass(settings.stacking === 'stacked')}
@@ -626,25 +626,19 @@ export default function AppPage() {
                 </button>
               </div>
               <p className="text-[9px] text-white/25 mb-4">
-                {settings.groupByColor
-                  ? 'Grouping by color requires cut-outs, so stacking is locked.'
-                  : settings.stacking === 'stacked'
-                    ? 'Shapes layer on top of each other — no gaps, smaller files.'
-                    : 'Each shape is cut out of the one below — nothing hides behind anything.'}
+                {settings.stacking === 'stacked'
+                  ? 'Each color sits on top of the one below — no gaps between colors.'
+                  : 'Colors never overlap — best for cut files and screen printing.'}
               </p>
 
               <div className="flex items-center justify-between">
                 <div>
                   <p className="text-[10px] font-bold text-white/40 uppercase tracking-widest">Group by Color</p>
-                  <p className="text-[9px] text-white/25 mt-0.5">One layer per color — easy to edit in Illustrator.</p>
+                  <p className="text-[9px] text-white/25 mt-0.5">One named group per color in the SVG (DXF always uses one layer per color).</p>
                 </div>
                 <button
                   onClick={() =>
-                    updateSettings(
-                      settings.groupByColor
-                        ? { groupByColor: false }
-                        : { groupByColor: true, stacking: 'cutout' },
-                    )
+                    updateSettings({ groupByColor: !settings.groupByColor })
                   }
                   className={`relative w-11 h-6 rounded-full transition-colors flex-shrink-0 ${settings.groupByColor ? 'bg-[#C1FF00]' : 'bg-white/10'}`}
                 >
@@ -883,7 +877,7 @@ export default function AppPage() {
                 </div>
                 <button
                   onClick={handleDownloadDxf}
-                  title="Download DXF for cutters, lasers and CAD (one layer per color; Cutout shapes work best)"
+                  title="Download DXF for cutters, lasers and CAD (one layer per color; Cut-outs work best)"
                   className="flex items-center gap-2 bg-white/10 hover:bg-white/20 text-white px-4 py-2.5 rounded-lg text-[10px] font-bold uppercase tracking-widest transition-colors"
                 >
                   <Scissors className="w-4 h-4" /> DXF

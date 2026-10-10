@@ -228,8 +228,8 @@ function restoreCorner(
   cluster: CornerCluster,
   closed: boolean,
   /** How far along each edge to sample its direction (px); kept short of the neighboring corners. */
-  reachBefore = 6,
-  reachAfter = 6,
+  reachBefore = 3,
+  reachAfter = 3,
 ): Point | null {
   if (reachBefore < 1.5 || reachAfter < 1.5) return null;
   const a1 = walkVertex(pts, cluster.from, 0.5, -1, closed);
@@ -251,12 +251,52 @@ function restoreCorner(
   const iy = a1.y + t * day;
 
   const apexPt = pts[cluster.apex];
-  if (Math.hypot(ix - apexPt.x, iy - apexPt.y) > 6) return null; // implausibly far: nearly parallel edges
+  if (Math.hypot(ix - apexPt.x, iy - apexPt.y) > 4) return null; // implausibly far: nearly parallel edges
   return { x: ix, y: iy };
 }
 
+/**
+ * Square end cap for a U-turn (the end of a thin stroke, rounded off by
+ * smoothing): the two sides are extended to a flat end at the stroke's tip.
+ * Returns the two cap corners, or null when the sides aren't parallel enough.
+ */
+function squareCap(pts: Point[], cluster: CornerCluster, closed: boolean, reachBefore: number, reachAfter: number): Point[] | null {
+  if (reachBefore < 1 || reachAfter < 1) return null;
+  const a1 = walkVertex(pts, cluster.from, 0.25, -1, closed);
+  const a2 = walkVertex(pts, cluster.from, reachBefore, -1, closed);
+  const b1 = walkVertex(pts, cluster.to, 0.25, 1, closed);
+  const b2 = walkVertex(pts, cluster.to, reachAfter, 1, closed);
+  if (!a1 || !a2 || !b1 || !b2) return null;
+  const dA = { x: a1.x - a2.x, y: a1.y - a2.y }; // along side A, toward the tip
+  const dB = { x: b1.x - b2.x, y: b1.y - b2.y }; // along side B, toward the tip
+  const mA = Math.hypot(dA.x, dA.y);
+  const mB = Math.hypot(dB.x, dB.y);
+  if (mA < 1e-6 || mB < 1e-6) return null;
+  dA.x /= mA; dA.y /= mA; dB.x /= mB; dB.y /= mB;
+  if (dA.x * dB.x + dA.y * dB.y < 0.9) return null; // sides must run (nearly) parallel
+
+  const u = { x: dA.x + dB.x, y: dA.y + dB.y };
+  const mu = Math.hypot(u.x, u.y);
+  u.x /= mu; u.y /= mu;
+  // The tip: the farthest sample along the stroke direction.
+  let tip = -Infinity;
+  const n = pts.length;
+  for (let i = cluster.apex - 6; i <= cluster.apex + 6; i++) {
+    const p = pts[closed ? ((i % n) + n) % n : Math.min(n - 1, Math.max(0, i))];
+    tip = Math.max(tip, p.x * u.x + p.y * u.y);
+  }
+  const onCap = (p: Point, d: Point) => {
+    const t = (tip - (p.x * u.x + p.y * u.y)) / (d.x * u.x + d.y * u.y);
+    return t >= -0.5 && t <= 4 ? { x: p.x + t * d.x, y: p.y + t * d.y } : null;
+  };
+  const c1 = onCap(a1, dA);
+  const c2 = onCap(b1, dB);
+  if (!c1 || !c2 || dist(c1, c2) > 6) return null;
+  return [c1, c2];
+}
+
 /** Kasa least-squares circle fit. */
-function fitCircle(pts: Point[]): { cx: number; cy: number; r: number; maxResidual: number } | null {
+function fitCircle(pts: Point[]): { cx: number; cy: number; r: number; maxResidual: number; rmsResidual: number } | null {
   const n = pts.length;
   let sx = 0, sy = 0, sxx = 0, syy = 0, sxy = 0, sxz = 0, syz = 0, sz = 0;
   for (const p of pts) {
@@ -293,10 +333,13 @@ function fitCircle(pts: Point[]): { cx: number; cy: number; r: number; maxResidu
   const r = Math.sqrt(r2);
 
   let maxResidual = 0;
+  let sumSq = 0;
   for (const p of pts) {
-    maxResidual = Math.max(maxResidual, Math.abs(Math.hypot(p.x - cx, p.y - cy) - r));
+    const e = Math.abs(Math.hypot(p.x - cx, p.y - cy) - r);
+    maxResidual = Math.max(maxResidual, e);
+    sumSq += e * e;
   }
-  return { cx, cy, r, maxResidual };
+  return { cx, cy, r, maxResidual, rmsResidual: Math.sqrt(sumSq / pts.length) };
 }
 
 function signedArea(pts: Point[]) {
@@ -314,7 +357,8 @@ function tryCircleSnap(pts: Point[]): string | null {
   if (pts.length < 12) return null;
   const fit = fitCircle(pts);
   if (!fit || fit.r < 3) return null;
-  if (fit.maxResidual > Math.max(1.25, fit.r * 0.02)) return null;
+  // Tolerance scales with size: a small oval (the letter O) must not snap.
+  if (fit.rmsResidual > Math.max(0.15, fit.r * 0.012) || fit.maxResidual > Math.max(0.5, fit.r * 0.035)) return null;
 
   // Require full angular coverage so arcs/crescents don't snap.
   const angles = pts
@@ -413,7 +457,7 @@ function fitRunWithLines(
   startTan?: Point | null,
   endTan?: Point | null,
 ): string | null {
-  const MIN_LINE = 12; // px
+  const MIN_LINE = 6; // px
   const run = input.slice();
   const last = run.length - 1;
   const straight = (i0: number, i1: number) => isLineLike(run, i0, i1, noise);
@@ -638,10 +682,12 @@ function turnK(pts: Point[], i: number, k: number, closed: boolean): number {
  */
 function detectCorners(pts: Point[], closed: boolean, cornerDeg: number, step: number) {
   const n = pts.length;
-  const kBig = Math.max(2, Math.round(3 / step));
-  const kSmall = Math.max(1, Math.round(1.5 / step));
+  // Scales are small enough for 2px letter strokes; edge noise is already
+  // removed by the raster boundary smoothing.
+  const kBig = Math.max(2, Math.round(1.5 / step));
+  const kSmall = Math.max(1, Math.round(0.75 / step));
   const big = new Float64Array(n);
-  if (n < 2 * kBig + 2) return { corners: [] as number[], big, kSmall };
+  if (n < 2 * kBig + 2) return { corners: [] as number[], big, kSmall, kBig };
   for (let i = 0; i < n; i++) big[i] = turnK(pts, i, kBig, closed);
 
   // Score each sample; 0 = not a corner candidate.
@@ -669,7 +715,7 @@ function detectCorners(pts: Point[], closed: boolean, cornerDeg: number, step: n
     }
     if (isMax) corners.push(i);
   }
-  return { corners, big, kSmall };
+  return { corners, big, kSmall, kBig };
 }
 
 function rebuildSubpath(sub: Subpath, maxError: number, cornerDeg: number): string | null {
@@ -689,9 +735,18 @@ function rebuildSubpath(sub: Subpath, maxError: number, cornerDeg: number): stri
   }
 
   const sampled = resample(pts, sub.closed, STEP);
-  pts = smoothPolyline(sampled, sub.closed, 3);
+  pts = smoothPolyline(sampled, sub.closed, 2);
   const n = pts.length;
   if (n < 4) return null;
+
+  // Tiny closed loops (small counters, dots): corner logic has nothing to
+  // work with at this size, so fit one smooth, tight loop.
+  if (sub.closed && n * STEP < 12) {
+    const loop = [...pts, pts[0]];
+    const tan = unit(pts[1].x - pts[n - 1].x, pts[1].y - pts[n - 1].y);
+    const piece = fitRun(loop, 0.15, 0, tan, tan && { x: -tan.x, y: -tan.y });
+    return piece === null ? null : `M${round(pts[0].x)} ${round(pts[0].y)}${piece}Z`;
+  }
 
   // Outline noise: how far smoothing moved the samples. Corners move most,
   // so drop the top 10% before taking the RMS.
@@ -701,6 +756,14 @@ function rebuildSubpath(sub: Subpath, maxError: number, cornerDeg: number): stri
 
   const detected = detectCorners(pts, sub.closed, cornerDeg, STEP);
   let cornerIdx = detected.corners;
+  const DBG = process.env.GDBG && pts.every((p) => p.x > 210 && p.x < 224 && p.y > 88 && p.y < 108);
+  if (DBG) {
+    console.error('P subpath n=', n, 'closed', sub.closed);
+    // bottom-most samples and their turns
+    const order = pts.map((p, i) => i).sort((a, b) => pts[b].y - pts[a].y).slice(0, 12);
+    for (const i of order) console.error(`  i=${i} (${pts[i].x.toFixed(2)},${pts[i].y.toFixed(2)}) big=${detected.big[i].toFixed(0)} small=${turnK(pts, i, detected.kSmall, sub.closed).toFixed(0)}`);
+    console.error('  corners', cornerIdx.map((c) => `${c}:${detected.big[c].toFixed(0)}`).join(' '));
+  }
 
   if (sub.closed && cornerIdx.length > 0) {
     // Start the loop at a corner so no corner zone straddles the seam.
@@ -710,24 +773,38 @@ function rebuildSubpath(sub: Subpath, maxError: number, cornerDeg: number): stri
   }
 
   // Each corner replaces a short zone (rounded by smoothing) with the
-  // reconstructed sharp point.
-  const zs = detected.kSmall;
+  // reconstructed sharp point. A U-turn (the end of a thin stroke) becomes a
+  // square cap with two corners instead — one point there makes a spike.
+  const k = cornerIdx.length;
   const gapPx = (a: number, b: number) => (((b - a + n) % n) || n) * STEP; // samples a→b, forward
-  const restored = cornerIdx.map((c, j) => {
+  // A U-turn spans more than the detection window on thin strokes, so judge
+  // it over twice the distance.
+  const isCap = cornerIdx.map((c) => turnK(pts, c, 2 * detected.kBig, sub.closed) >= 150);
+  const zoneSize = isCap.map((cap) => (cap ? detected.kBig : detected.kSmall));
+  const restored = cornerIdx.map((c, j): Point[] => {
+    const zs = zoneSize[j];
     const from = sub.closed ? (c - zs + n) % n : Math.max(0, c - zs);
     const to = sub.closed ? (c + zs) % n : Math.min(n - 1, c + zs);
     // Don't let the edge-direction samples run into the neighboring corner's zone.
-    const k = cornerIdx.length;
     const prev = k > 1 || sub.closed ? cornerIdx[(j - 1 + k) % k] : -1;
     const next = k > 1 || sub.closed ? cornerIdx[(j + 1) % k] : -1;
-    const zonePx = 2 * zs * STEP + 0.5;
-    const before = prev >= 0 && (sub.closed || prev < c) ? gapPx(prev, c) - zonePx : 6;
-    const after = next >= 0 && (sub.closed || next > c) ? gapPx(c, next) - zonePx : 6;
-    return restoreCorner(pts, { from, to, apex: c }, sub.closed, Math.min(6, before), Math.min(6, after)) ?? pts[c];
+    const prevZone = prev >= 0 ? zoneSize[(j - 1 + k) % k] : 0;
+    const nextZone = next >= 0 ? zoneSize[(j + 1) % k] : 0;
+    const before = prev >= 0 && (sub.closed || prev < c) ? gapPx(prev, c) - (zs + prevZone) * STEP - 0.5 : 6;
+    const after = next >= 0 && (sub.closed || next > c) ? gapPx(c, next) - (zs + nextZone) * STEP - 0.5 : 6;
+    const cluster = { from, to, apex: c };
+    if (isCap[j]) {
+      const cap = squareCap(pts, cluster, sub.closed, Math.min(3, before), Math.min(3, after));
+      if (cap) return cap;
+    }
+    const corner = restoreCorner(pts, cluster, sub.closed, Math.min(3, before), Math.min(3, after));
+    if (corner) return [corner];
+    // Near-parallel sides make the corner unrecoverable; a cap beats a spike.
+    return squareCap(pts, cluster, sub.closed, Math.min(3, before), Math.min(3, after)) ?? [pts[c]];
   });
   const zoneOf = new Int32Array(n).fill(-1);
   cornerIdx.forEach((c, j) => {
-    for (let d = -zs; d <= zs; d++) {
+    for (let d = -zoneSize[j]; d <= zoneSize[j]; d++) {
       let i = c + d;
       if (sub.closed) i = ((i % n) + n) % n;
       else if (i < 0 || i >= n) continue;
@@ -742,8 +819,10 @@ function rebuildSubpath(sub: Subpath, maxError: number, cornerDeg: number): stri
     if (j < 0) {
       rebuilt.push(pts[i]);
     } else if (i === cornerIdx[j]) {
-      corners.push(rebuilt.length);
-      rebuilt.push(restored[j]);
+      for (const point of restored[j]) {
+        corners.push(rebuilt.length);
+        rebuilt.push(point);
+      }
     }
   }
   pts = rebuilt;
@@ -839,7 +918,7 @@ function polylineD(sub: Subpath) {
 
 export function refineTracedSvg(svg: string, options: RefineOptions): string {
   const smoothness = Math.min(100, Math.max(0, options.smoothness));
-  const maxError = 0.35 + (smoothness / 100) * 1.4;
+  const maxError = 0.25 + (smoothness / 100) * 0.6;
   const cornerDeg = 28 + smoothness * 0.3;
   const scale = options.scale ?? 1;
   const curves = options.curves ?? true;

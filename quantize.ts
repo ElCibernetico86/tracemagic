@@ -162,6 +162,14 @@ function deltaE(a: ArrayLike<number>, b: ArrayLike<number>) {
   return Math.sqrt(dl * dl + da * da + db * db);
 }
 
+/** Lightness-weighted color distance used to spot compression tints. */
+function tintDistance(a: ArrayLike<number>, b: ArrayLike<number>) {
+  const dl = a[0] - b[0];
+  const da = a[1] - b[1];
+  const db = a[2] - b[2];
+  return Math.sqrt(4 * dl * dl + 0.4 * (da * da + db * db));
+}
+
 function discoverPalette(img: RawImage, blend: Uint8Array, interior: Uint8Array, maxColors: number | null): RGB[] {
   const { data, width: w, height: h } = img;
 
@@ -233,14 +241,6 @@ function discoverPalette(img: RawImage, blend: Uint8Array, interior: Uint8Array,
     clusters = clusters.filter((c) => c.weight > 0);
   }
 
-  // Drop colors that don't fill any solid area (JPEG ringing, edge halos,
-  // specks). Large-but-never-solid colors survive: thin lines, fine texture.
-  const minInterior = Math.max(4, total * 0.0002);
-  const minWeight = Math.max(8, total * 0.0004);
-  const keep = clusters.filter(
-    (c) => c.weight >= minWeight && (c.interior >= minInterior || c.weight >= total * 0.006),
-  );
-  clusters = keep.length > 0 ? keep : clusters;
   const mergeInto = (big: Cluster, small: Cluster, keepColor: boolean) => {
     const wsum = big.weight + small.weight;
     if (!keepColor) {
@@ -282,18 +282,30 @@ function discoverPalette(img: RawImage, blend: Uint8Array, interior: Uint8Array,
 
   // 2. Satellites: a small color near a much larger one is a compression tint
   //    of it (JPEG stores color at half resolution, so tints bleed past edges).
+  //    Tints keep the host's lightness and drift in hue, so the comparison
+  //    weights lightness up and chroma down.
   for (const small of [...clusters].sort((a, b) => a.weight - b.weight)) {
     let host: Cluster | null = null;
     let hostD = Infinity;
     for (const c of clusters) {
       if (c === small || c.weight < small.weight * 12) continue;
-      const d = deltaE(c.lab, small.lab);
+      const d = tintDistance(c.lab, small.lab);
       if (d < hostD) { hostD = d; host = c; }
     }
     if (host && hostD < SATELLITE_DELTA_E) mergeInto(host, small, true);
   }
 
-  // 3. Respect the color limit: merge the cheapest pair (Ward-style cost, so
+  // 3. Drop colors that don't fill any solid area (JPEG ringing, edge halos,
+  //    specks). Colors without solid interior still count if there's enough of
+  //    them: thin lines and small text never have interior pixels.
+  const minInterior = Math.max(4, total * 0.0002);
+  const minWeight = Math.max(8, total * 0.0004);
+  const keep = clusters.filter(
+    (c) => c.weight >= minWeight && (c.interior >= minInterior || c.weight >= total * 0.0015),
+  );
+  clusters = keep.length > 0 ? keep : clusters;
+
+  // 4. Respect the color limit: merge the cheapest pair (Ward-style cost, so
   //    absorbing a small area beats merging two big ones).
   const limit = Math.min(MAX_PALETTE, maxColors ?? MAX_PALETTE);
   while (clusters.length > limit) {
@@ -330,7 +342,14 @@ function discoverPalette(img: RawImage, blend: Uint8Array, interior: Uint8Array,
  */
 const L_WEIGHT = 2;
 
-function nearestLabel(lab: Float64Array, paletteLab: Float64Array, lo: number, hi: number) {
+/**
+ * Near-ties between a locally dominant color and a minority color go to the
+ * minority (its squared distance is scaled by this). Thin lines antialiased
+ * across two pixels sit at ~50% and would otherwise break into dashes.
+ */
+const MINORITY_FAVOR = 0.6;
+
+function nearestLabel(lab: Float64Array, paletteLab: Float64Array, lo: number, hi: number, majority = -1) {
   // lo/hi: 32-bit candidate masks for labels 0–31 / 32–63.
   let best = -1;
   let bestD = Infinity;
@@ -341,7 +360,8 @@ function nearestLabel(lab: Float64Array, paletteLab: Float64Array, lo: number, h
     const dl = lab[0] - paletteLab[k * 3];
     const da = lab[1] - paletteLab[k * 3 + 1];
     const db = lab[2] - paletteLab[k * 3 + 2];
-    const d = L_WEIGHT * dl * dl + da * da + db * db;
+    let d = L_WEIGHT * dl * dl + da * da + db * db;
+    if (majority >= 0 && k !== majority) d *= MINORITY_FAVOR;
     if (d < bestD) { bestD = d; best = k; }
   }
   return best;
@@ -369,15 +389,41 @@ export function quantizeForTrace(source: RawImage, upscaled: RawImage, options: 
   const lab = new Float64Array(3);
   const maskLo = new Uint32Array(w * h);
   const maskHi = new Uint32Array(w * h);
+  const srcLabel = new Int8Array(w * h).fill(-1);
   for (let p = 0; p < w * h; p++) {
     const i = p * 4;
     if (data[i + 3] < OPAQUE || blend[p]) continue;
     rgbToLab(data[i], data[i + 1], data[i + 2], lab, 0);
     const k = nearestLabel(lab, paletteLab, allLo, allHi);
+    srcLabel[p] = k;
     if (k < 32) maskLo[p] = (1 << k) >>> 0;
     else maskHi[p] = (1 << (k - 32)) >>> 0;
   }
   const R = 2;
+
+  // Locally dominant color per source pixel (mode of solid labels in 5×5).
+  const majority = new Int8Array(w * h).fill(-1);
+  {
+    const counts = new Int32Array(palette.length);
+    for (let y = 0; y < h; y++) {
+      for (let x = 0; x < w; x++) {
+        counts.fill(0);
+        for (let dy = -R; dy <= R; dy++) {
+          const yy = y + dy;
+          if (yy < 0 || yy >= h) continue;
+          for (let dx = -R; dx <= R; dx++) {
+            const xx = x + dx;
+            if (xx < 0 || xx >= w) continue;
+            const l = srcLabel[yy * w + xx];
+            if (l >= 0) counts[l]++;
+          }
+        }
+        let best = -1, bestCount = 0;
+        for (let k = 0; k < counts.length; k++) if (counts[k] > bestCount) { bestCount = counts[k]; best = k; }
+        majority[y * w + x] = best;
+      }
+    }
+  }
   const tmpLo = new Uint32Array(w * h);
   const tmpHi = new Uint32Array(w * h);
   for (let y = 0; y < h; y++) {
@@ -423,7 +469,7 @@ export function quantizeForTrace(source: RawImage, upscaled: RawImage, options: 
       const srcX = Math.min(w - 1, Math.floor((x + 0.5) * sx));
       const sp = srcY * w + srcX;
       rgbToLab(U.data[i], U.data[i + 1], U.data[i + 2], lab, 0);
-      let k = nearestLabel(lab, paletteLab, candLo[sp], candHi[sp]);
+      let k = nearestLabel(lab, paletteLab, candLo[sp], candHi[sp], majority[sp]);
       if (k < 0) k = nearestLabel(lab, paletteLab, allLo, allHi);
       const [r, g, b] = palette[k];
       out[i] = r;
