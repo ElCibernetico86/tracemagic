@@ -3,7 +3,7 @@ import path from 'path';
 import { createServer as createViteServer } from 'vite';
 import multer from 'multer';
 import cors from 'cors';
-import { SUPPORTED_IMAGE_TYPES, parseTraceOptions, traceImage } from './trace-pipeline.js';
+import { SUPPORTED_IMAGE_TYPES, parseTraceOptions, renderPng, traceImage } from './trace-pipeline.js';
 
 const app = express();
 const PORT = Number(process.env.PORT) || 3000;
@@ -64,7 +64,21 @@ app.post('/api/vectorize', (req, res) => {
   });
 });
 
-// 2. Mock Stripe Checkout
+// 2. Large PNG export (see renderPng; mirrored by api/render-png.ts on Vercel)
+app.post('/api/render-png', express.json({ limit: '20mb' }), async (req, res) => {
+  const { svg, width } = req.body ?? {};
+  if (typeof svg !== 'string' || !svg.includes('<svg') || !Number.isInteger(width) || width < 16 || width > 8000) {
+    return res.status(400).json({ error: 'Send { svg, width } with a width between 16 and 8000.' });
+  }
+  try {
+    res.type('png').send(await renderPng(svg, width));
+  } catch (error: any) {
+    console.error('PNG render error:', error);
+    res.status(500).json({ error: 'Failed to render PNG.', details: error.message });
+  }
+});
+
+// 3. Mock Stripe Checkout
 app.post('/api/create-checkout-session', async (req, res) => {
   // In a real app, use the stripe SDK
   const { priceId } = req.body;

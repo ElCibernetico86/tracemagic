@@ -2,6 +2,7 @@
 // With no URL it calls the Vercel function handler (api/vectorize.ts) directly.
 import sharp from 'sharp';
 import { POST } from '../api/vectorize.js';
+import { POST as renderPost } from '../api/render-png.js';
 import { LOGOS } from './logos.js';
 
 async function call(base: string | undefined, body: FormData) {
@@ -9,8 +10,15 @@ async function call(base: string | undefined, body: FormData) {
   return fetch(`${base.replace(/\/$/, '')}/api/vectorize`, { method: 'POST', body });
 }
 
+async function render(base: string | undefined, svg: string, width: number) {
+  const init = { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ svg, width }) };
+  if (!base) return renderPost(new Request('http://local/api/render-png', init));
+  return fetch(`${base.replace(/\/$/, '')}/api/render-png`, init);
+}
+
 async function main() {
   const base = process.argv[2];
+  let lastSvg = '';
   const png = await sharp(Buffer.from(LOGOS.badge)).png().toBuffer();
   const jpg = await sharp(Buffer.from(LOGOS.geometric)).flatten({ background: '#fff' }).jpeg({ quality: 70 }).toBuffer();
 
@@ -24,9 +32,22 @@ async function main() {
     let summary = text.slice(0, 160);
     try {
       const j = JSON.parse(text);
+      if (j.svg) lastSvg = j.svg;
       summary = j.stats ? `paths=${j.stats.paths} colors=${j.stats.colors} server=${j.stats.durationMs}ms` : JSON.stringify(j);
     } catch {}
     console.log(`${name.padEnd(14)} ${res.status} ${summary} total=${Date.now() - started}ms`);
+  }
+
+  for (const width of [4500, 6000]) {
+    const started = Date.now();
+    const res = await render(base, lastSvg, width);
+    if (!res.ok) {
+      console.log(`png ${width}px      ${res.status} ${await res.text()}`);
+      continue;
+    }
+    const png = Buffer.from(await res.arrayBuffer());
+    const meta = await sharp(png).metadata();
+    console.log(`png ${width}px      ${res.status} ${meta.width}x${meta.height} alpha=${meta.hasAlpha} ${(png.length / 1024).toFixed(0)}KB ${Date.now() - started}ms`);
   }
 
   const bad = new FormData();

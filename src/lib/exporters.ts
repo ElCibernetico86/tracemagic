@@ -15,12 +15,40 @@ function svgSize(svg: string): { width: number; height: number } {
   };
 }
 
-/** Render the SVG at `targetWidth` pixels wide (height keeps the aspect ratio), transparent background. */
+/** iOS Safari refuses canvases larger than this many pixels (4096 × 4096). */
+const MAX_CANVAS_PIXELS = 16_777_216;
+
+async function renderPngOnServer(svg: string, width: number): Promise<Blob> {
+  const res = await fetch('/api/render-png', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ svg, width }),
+  });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data.error || `PNG export failed (${res.status}).`);
+  }
+  return res.blob();
+}
+
+/**
+ * Render the SVG at `targetWidth` pixels wide (height keeps the aspect ratio),
+ * transparent background. Sizes beyond the iPad's canvas limit — or any
+ * canvas failure — are rendered on the server instead.
+ */
 export async function svgToPng(svg: string, targetWidth: number): Promise<Blob> {
   const { width, height } = svgSize(svg);
   const outW = Math.max(1, Math.round(targetWidth));
   const outH = Math.max(1, Math.round((targetWidth * height) / width));
+  if (outW * outH > MAX_CANVAS_PIXELS) return renderPngOnServer(svg, outW);
+  try {
+    return await svgToPngInBrowser(svg, width, height, outW, outH);
+  } catch {
+    return renderPngOnServer(svg, outW);
+  }
+}
 
+async function svgToPngInBrowser(svg: string, width: number, height: number, outW: number, outH: number): Promise<Blob> {
   // Pin the intrinsic size so the browser rasterizes the vector at full
   // resolution instead of scaling up a small bitmap.
   const sized = svg.replace(/<svg\b([^>]*)>/, (_m, attrs: string) => {

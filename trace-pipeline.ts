@@ -371,3 +371,17 @@ export async function traceImage(
     },
   };
 }
+
+/**
+ * Rasterize an SVG to PNG at `width` pixels wide (height keeps the aspect
+ * ratio). Server-side because iPad Safari can't make canvases above ~16.7M
+ * pixels, so a 4500px print PNG can't be drawn in the browser there.
+ */
+export async function renderPng(svg: string, width: number): Promise<Buffer> {
+  const input = Buffer.from(svg);
+  const { width: baseWidth } = await sharp(input).metadata();
+  // Render at the density that produces the target width directly, so the
+  // vector is rasterized at full resolution rather than upscaled.
+  const density = Math.min(100000, 72 * (width / (baseWidth || width)));
+  return sharp(input, { density }).resize({ width }).png({ compressionLevel: 9 }).toBuffer();
+}
