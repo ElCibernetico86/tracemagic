@@ -538,7 +538,9 @@ function tryCircleSnap(pts: Point[]): string | null {
   const fit = fitCircle(pts);
   if (!fit || fit.r < 3) return null;
   // Tolerance scales with size: a small oval (the letter O) must not snap.
-  if (fit.rmsResidual > Math.max(0.15, fit.r * 0.012) || fit.maxResidual > Math.max(0.5, fit.r * 0.035)) return null;
+  // Small round shapes (dots) get a little more slack: JPEG blur leaves them
+  // slightly out of round, and a dot that isn't round looks wrong.
+  if (fit.rmsResidual > Math.max(0.25, fit.r * 0.012) || fit.maxResidual > Math.max(0.75, fit.r * 0.035)) return null;
 
   // Require full angular coverage so arcs/crescents don't snap.
   const angles = pts
@@ -917,6 +919,26 @@ function robustLine(run: Point[], noise: number, thickness: number): { c: Point;
 }
 
 /**
+ * A run that lies within ~1.2px of a perfectly level or plumb line (fitted
+ * direction within 3° of the axis) — returned as that axis line, positioned
+ * at the run's median offset.
+ */
+function axisLine(run: Point[], thickness: number): { c: Point; u: Point } | null {
+  const q = lineQuality(run, 0, run.length - 1);
+  const deg = (Math.atan2(q.uy, q.ux) * 180) / Math.PI;
+  const nearest = Math.round(deg / 90) * 90;
+  if (Math.abs(deg - nearest) > 3) return null;
+  const vertical = Math.abs(nearest) % 180 === 90;
+  const offsets = run.map((p) => (vertical ? p.x : p.y)).sort((a, b) => a - b);
+  const median = offsets[Math.floor(offsets.length / 2)];
+  const slack = Math.max(1.2, Math.min(2, 0.1 * thickness));
+  if (offsets[0] < median - slack || offsets[offsets.length - 1] > median + slack) return null;
+  const c = vertical ? { x: median, y: q.cy } : { x: q.cx, y: median };
+  const r = (nearest * Math.PI) / 180;
+  return { c, u: { x: Math.round(Math.cos(r)), y: Math.round(Math.sin(r)) } };
+}
+
+/**
  * Corners found from straight edges (Potrace-style): long straight stretches
  * of the outline, separated by a short messy gap and pointing clearly
  * different ways, meet in a corner at the intersection of their lines —
@@ -980,6 +1002,57 @@ function linePairCorners(pts: Point[], closed: boolean, noise: number, minLen: n
     out.push({ from: toOrig(A.b), to: toOrig((A.b + gap) % n), point: p });
   }
   return out;
+}
+
+/**
+ * Corner detection for thick shapes: at each sample, fit straight lines to
+ * the outline over `half` px on each side and measure the angle between them.
+ * Least-squares fits shrug off JPEG speckle and small dips, so a notch (the
+ * n's shoulder) reads as one corner instead of a jittery pair, while a curve
+ * of radius r only reaches about half/r — tight text curves stay curves.
+ */
+function detectCornersLS(pts: Point[], closed: boolean, cornerDeg: number, step: number, half: number) {
+  const n = pts.length;
+  const kBig = Math.max(2, Math.round(half / step));
+  const kSmall = Math.max(1, Math.round(half / 2 / step));
+  const score = new Float64Array(n);
+  if (n < 2 * kBig + 2) return { corners: [] as number[], big: score, kSmall, kBig };
+  const turnAt = (i: number, h: number) => {
+    const a = armLine(pts, i, -1, h, closed, 0.25);
+    const b = armLine(pts, i, 1, h, closed, 0.25);
+    if (!a || !b) return 0;
+    return (Math.acos(Math.max(-1, Math.min(1, -(a.u.x * b.u.x + a.u.y * b.u.y)))) * 180) / Math.PI;
+  };
+  for (let i = 0; i < n; i++) score[i] = turnAt(i, half);
+  const fine = new Float64Array(n);
+  for (let i = 0; i < n; i++) fine[i] = turnAt(i, half / 2);
+  // A corner's turn is concentrated: somewhere close by, the half-size window
+  // already sees most of it. Along a tight curve the turn is spread out and
+  // the half-size window sees only about half.
+  const concentrated = (i: number) => {
+    let best = 0;
+    for (let d = -kSmall; d <= kSmall; d++) {
+      let j = i + d;
+      if (closed) j = ((j % n) + n) % n;
+      else if (j < 0 || j >= n) continue;
+      best = Math.max(best, fine[j]);
+    }
+    return best >= 0.6 * score[i];
+  };
+  const corners: number[] = [];
+  for (let i = 0; i < n; i++) {
+    if (score[i] < cornerDeg) continue;
+    let isMax = true;
+    for (let d = -kBig; d <= kBig && isMax; d++) {
+      if (d === 0) continue;
+      let j = i + d;
+      if (closed) j = ((j % n) + n) % n;
+      else if (j < 0 || j >= n) continue;
+      if (score[j] > score[i] || (score[j] === score[i] && j < i)) isMax = false;
+    }
+    if (isMax && concentrated(i)) corners.push(i);
+  }
+  return { corners, big: score, kSmall, kBig };
 }
 
 /** Re-sample a polyline at uniform arc-length spacing. */
@@ -1146,25 +1219,15 @@ function rebuildSubpath(sub: Subpath, maxError: number, cornerDeg: number, outli
   // intersection would make long spikes; on thin shapes keep it short.
   const maxCornerShift = thickness < 8 ? Math.max(1, 0.6 * thickness) : Math.max(4, 2 * cornerScale);
 
-  const detected = detectCorners(pts, sub.closed, cornerDeg, STEP, cornerScale);
+  // Thick shapes: robust line-fit detector (see detectCornersLS). Thin
+  // strokes (small text) keep the two-scale turn detector, whose small
+  // window fits their tightly packed features.
+  const lsHalf = Math.max(3, Math.min(8, 0.35 * thickness));
+  const detected =
+    thickness >= 8
+      ? detectCornersLS(pts, sub.closed, cornerDeg, STEP, lsHalf)
+      : detectCorners(pts, sub.closed, cornerDeg, STEP, cornerScale);
   let cornerIdx = detected.corners;
-  // On thick shapes, a real corner still turns when viewed over twice the
-  // window; a speck on a straight edge doesn't. (Thin text keeps every
-  // corner: its features are too close together for a wider window.)
-  if (thickness >= 8) {
-    // Compare straight-line fits of the edge on each side (4–10px): a zigzag
-    // on a straight edge leaves both sides pointing the same way.
-    const half = Math.max(4, Math.min(10, 0.4 * thickness));
-    cornerIdx = cornerIdx.filter((c) => {
-      const before = armLine(pts, c, -1, half, sub.closed, 0.5);
-      const after = armLine(pts, c, 1, half, sub.closed, 0.5);
-      if (!before || !after) return true;
-      // before.u points toward the corner (along the outline); after.u points back toward it.
-      const cos = -(before.u.x * after.u.x + before.u.y * after.u.y);
-      const turn = (Math.acos(Math.max(-1, Math.min(1, cos))) * 180) / Math.PI;
-      return turn >= 0.6 * cornerDeg;
-    });
-  }
 
   // Corners from straight edges catch soft or speckled corners the turn
   // detector misses; detected corners inside such a gap or along a straight
@@ -1335,7 +1398,10 @@ function rebuildSubpath(sub: Subpath, maxError: number, cornerDeg: number, outli
     const k0 = Math.round(trim / STEP);
     const k1 = run.length - 1 - k0;
     const middle = run.slice(k0, k1 + 1);
-    const line = middle.length >= 3 && (k1 - k0) * STEP >= 4 ? robustLine(middle, noise, thickness) : null;
+    let line = middle.length >= 3 && (k1 - k0) * STEP >= 4 ? robustLine(middle, noise, thickness) : null;
+    // Near-level/plumb edges get extra slack: in a logo they are virtually
+    // always meant to be straight, and JPEG often leaves a 1px step along them.
+    if (!line && snapAxes && middle.length >= 3 && (k1 - k0) * STEP >= 8) line = axisLine(middle, thickness);
     if (!line) {
       lineOf.push(null);
       continue;

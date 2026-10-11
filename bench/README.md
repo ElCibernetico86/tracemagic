@@ -24,4 +24,6 @@ Straight edges and corners:
   stay on this machine) and print corner + smoothness scores.
 - `npx tsx bench/zoom-file.ts <image> <out.png> <x> <y> <w> <h> <zoom> <svg...>` — zoomed crop of an
   input image above its traced SVG(s).
+- `npx tsx bench/corner-marks.ts <svg> <out.png> <x> <y> <w> <h> <zoom>` — zoomed render of a traced
+  SVG with every sharp joint (tangent change > 12°) marked in red: stray corners on curves stand out.
 

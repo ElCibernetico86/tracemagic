@@ -42,6 +42,8 @@ const MAX_PALETTE = 64;
 const MERGE_DELTA_E = 9;
 /** ΔE within which a much smaller color is absorbed as a tint of a big one. */
 const SATELLITE_DELTA_E = 20;
+/** A blend pixel this close (ΔE) to a palette color counts as that color. */
+const SOLID_DELTA_E = 7;
 const OPAQUE = 128;
 
 // ---------- color space ----------
@@ -402,9 +404,14 @@ export function quantizeForTrace(source: RawImage, upscaled: RawImage, options: 
   const srcLabel = new Int8Array(w * h).fill(-1);
   for (let p = 0; p < w * h; p++) {
     const i = p * 4;
-    if (data[i + 3] < OPAQUE || blend[p]) continue;
+    if (data[i + 3] < OPAQUE) continue;
     rgbToLab(data[i], data[i + 1], data[i + 2], lab, 0);
     const k = nearestLabel(lab, paletteLab, allLo, allHi);
+    // Blend pixels don't vouch for a color — unless they are that color
+    // already (a 95%-white pixel on a soft JPEG edge is white). Otherwise a
+    // soft edge can end up with no solid pixel of one side nearby, and the
+    // edge pixel is forced to the other color, row by row at random.
+    if (blend[p] && deltaE(lab, paletteLab.subarray(k * 3, k * 3 + 3)) > SOLID_DELTA_E) continue;
     srcLabel[p] = k;
     if (k < 32) maskLo[p] = (1 << k) >>> 0;
     else maskHi[p] = (1 << (k - 32)) >>> 0;
@@ -428,9 +435,15 @@ export function quantizeForTrace(source: RawImage, upscaled: RawImage, options: 
             if (l >= 0) counts[l]++;
           }
         }
-        let best = -1, bestCount = 0;
-        for (let k = 0; k < counts.length; k++) if (counts[k] > bestCount) { bestCount = counts[k]; best = k; }
-        majority[y * w + x] = best;
+        let best = -1, bestCount = 0, total = 0;
+        for (let k = 0; k < counts.length; k++) {
+          total += counts[k];
+          if (counts[k] > bestCount) { bestCount = counts[k]; best = k; }
+        }
+        // Only a clear majority counts (a thin feature on a background). At an
+        // edge between two big regions the window is near 50/50, and flipping
+        // the favor row by row would make the edge jitter.
+        majority[y * w + x] = bestCount >= 0.65 * total ? best : -1;
       }
     }
   }
