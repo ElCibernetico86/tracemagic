@@ -52,8 +52,8 @@ app.post('/api/vectorize', (req, res) => {
       }
 
       const options = parseTraceOptions(req.body ?? {});
-      const { svg, stats } = await traceImage(req.file.buffer, options);
-      res.json({ svg, engine: 'vtracer', stats });
+      const { svg, palette, stats } = await traceImage(req.file.buffer, options);
+      res.json({ svg, palette, engine: 'vtracer', stats });
     } catch (error: any) {
       console.error('Vectorization error:', error);
       res.status(500).json({

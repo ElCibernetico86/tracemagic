@@ -25,8 +25,8 @@ export async function POST(request: Request) {
 
   try {
     const buffer = Buffer.from(await image.arrayBuffer());
-    const { svg, stats } = await traceImage(buffer, parseTraceOptions(fields));
-    return Response.json({ svg, engine: 'vtracer', stats });
+    const { svg, palette, stats } = await traceImage(buffer, parseTraceOptions(fields));
+    return Response.json({ svg, palette, engine: 'vtracer', stats });
   } catch (error: any) {
     console.error('Vectorization error:', error);
     return Response.json({ error: 'Failed to vectorize image.', details: error.message }, { status: 500 });

@@ -36,10 +36,32 @@ export interface TraceOptions {
   curveMode: CurveMode;
   stacking: ShapeStacking;
   groupByColor: boolean;
+  /** Fixed palette chosen by the user (color reduction); null = detect. */
+  palette: RGB[] | null;
 }
 
 function clamp(value: number, min: number, max: number) {
   return Math.min(max, Math.max(min, value));
+}
+
+/** "#RRGGBB,#RRGGBB" or a JSON array of hex strings → RGB list (max 64), or null. */
+function parsePalette(value: unknown): RGB[] | null {
+  let items: unknown[] = [];
+  if (Array.isArray(value)) items = value;
+  else if (typeof value === 'string' && value.trim()) {
+    try {
+      const parsed = JSON.parse(value);
+      items = Array.isArray(parsed) ? parsed : [];
+    } catch {
+      items = value.split(',');
+    }
+  }
+  const colors = items
+    .map((v) => String(v).trim().replace(/^#/, ''))
+    .filter((hex) => /^[0-9a-fA-F]{6}$/.test(hex))
+    .slice(0, 64)
+    .map((hex) => [0, 2, 4].map((i) => parseInt(hex.slice(i, i + 2), 16)) as RGB);
+  return colors.length > 0 ? colors : null;
 }
 
 export function parseTraceOptions(body: Record<string, unknown>): TraceOptions {
@@ -60,7 +82,7 @@ export function parseTraceOptions(body: Record<string, unknown>): TraceOptions {
   const groupByColor = !(body.groupByColor === 'false' || body.groupByColor === false);
   const stacking: ShapeStacking = body.stacking === 'cutout' ? 'cutout' : 'stacked';
 
-  return { mode, maxColors, detail, smoothness, curveMode, stacking, groupByColor };
+  return { mode, maxColors, detail, smoothness, curveMode, stacking, groupByColor, palette: parsePalette(body.palette) };
 }
 
 function buildVectorizerConfig(options: TraceOptions, scale: number) {
@@ -186,7 +208,7 @@ async function preprocessImage(buffer: Buffer, options: TraceOptions) {
     const quantized = quantizeForTrace(
       { data: source.data, width, height },
       { data: upscaled.data, width: upscaled.info.width, height: upscaled.info.height },
-      { maxColors: options.maxColors },
+      { maxColors: options.maxColors, palette: options.palette },
     );
     palette = quantized.palette;
     // Iron out sub-pixel edge jitter (about half a source pixel); pixel mode
@@ -223,8 +245,17 @@ function svgStats(svg: string) {
   return { paths, colors: fills.size, bytes: Buffer.byteLength(svg, 'utf8') };
 }
 
+export interface PaletteEntry {
+  /** "#RRGGBB" */
+  color: string;
+  /** Share of the image's (opaque) area, 0–1. */
+  area: number;
+}
+
 export interface TraceResult {
   svg: string;
+  /** Colors in the result, largest area first. */
+  palette: PaletteEntry[];
   stats: { paths: number; colors: number; bytes: number; width: number; height: number; durationMs: number };
 }
 
@@ -402,8 +433,10 @@ export async function traceImage(
     `<svg xmlns="http://www.w3.org/2000/svg" width="${pre.width}" height="${pre.height}" ` +
     `viewBox="0 0 ${pre.width} ${pre.height}">${body}</svg>`;
 
+  const opaque = area.reduce((sum, a) => sum + a, 0) || 1;
   return {
     svg,
+    palette: order.map((k) => ({ color: `#${toHex(palette[k])}`, area: area[k] / opaque })),
     stats: {
       ...svgStats(svg),
       width: pre.width,

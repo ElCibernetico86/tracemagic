@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect, useCallback, ChangeEvent } from 'react';
+import React, { useState, useRef, useEffect, useCallback, useMemo, ChangeEvent } from 'react';
 import {
   Upload,
   Download,
@@ -16,6 +16,8 @@ import {
   Image as ImageIcon,
   PenTool,
   Scissors,
+  Palette,
+  RotateCcw,
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { collection, addDoc, serverTimestamp } from 'firebase/firestore';
@@ -24,6 +26,7 @@ import { useAuthState } from 'react-firebase-hooks/auth';
 import { useLocation, useNavigate } from 'react-router-dom';
 import { svgToDxf, svgToPng } from '../lib/exporters';
 import { downloadBlob } from '../lib/download';
+import { mapToNearest, recolorSvg, reducePalette, type PaletteEntry } from '../lib/palette';
 
 type TraceMode = 'color' | 'grayscale' | 'bw';
 type CurveMode = 'spline' | 'polygon' | 'pixel';
@@ -135,6 +138,12 @@ export default function AppPage() {
   const [imageAspect, setImageAspect] = useState<number | null>(null);
   const [isTracing, setIsTracing] = useState(false);
   const [svgResult, setSvgResult] = useState<string | null>(null);
+  // Color reduction: the auto-detected palette, the colors picked in the
+  // Colors panel (null = unchanged), and the palette the tracer was told to use.
+  const [basePalette, setBasePalette] = useState<PaletteEntry[] | null>(null);
+  const [resultPalette, setResultPalette] = useState<PaletteEntry[] | null>(null);
+  const [keep, setKeep] = useState<string[] | null>(null);
+  const [fixedPalette, setFixedPalette] = useState<string[] | null>(null);
   const [stats, setStats] = useState<TraceStats | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
@@ -167,6 +176,10 @@ export default function AppPage() {
     setFile(selected);
     setPreview(URL.createObjectURL(selected));
     setSvgResult(null);
+    setBasePalette(null);
+    setResultPalette(null);
+    setKeep(null);
+    setFixedPalette(null);
     setStats(null);
     setError(null);
     setZoom(1);
@@ -226,6 +239,7 @@ export default function AppPage() {
     formData.append('curveMode', settings.curveMode);
     formData.append('stacking', settings.stacking);
     formData.append('groupByColor', String(settings.groupByColor));
+    if (fixedPalette) formData.append('palette', JSON.stringify(fixedPalette));
 
     try {
       const res = await fetch('/api/vectorize', {
@@ -239,13 +253,16 @@ export default function AppPage() {
       }
       setSvgResult(data.svg);
       setStats(data.stats ?? null);
+      setResultPalette(data.palette ?? null);
+      if (!fixedPalette) setBasePalette(data.palette ?? null);
+      setKeep(null);
       hasTracedRef.current = true;
     } catch (err: any) {
       if (err.name !== 'AbortError') setError(err.message);
     } finally {
       if (abortRef.current === controller) setIsTracing(false);
     }
-  }, [file, settings]);
+  }, [file, settings, fixedPalette]);
 
   // Re-trace automatically when settings change after the first trace.
   useEffect(() => {
@@ -254,6 +271,13 @@ export default function AppPage() {
     return () => clearTimeout(timer);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [settings]);
+
+  // Re-trace when a reduced palette is applied (or reset).
+  useEffect(() => {
+    if (!file || !hasTracedRef.current) return;
+    runTrace();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [fixedPalette]);
 
   // Non-passive wheel listener so zooming doesn't scroll the page.
   useEffect(() => {
@@ -283,6 +307,11 @@ export default function AppPage() {
 
   const updateSettings = (patch: Partial<TraceSettings>) => {
     setPreset('custom');
+    // A new color mode or color limit makes a hand-picked palette meaningless.
+    if ('mode' in patch || 'autoColors' in patch || 'maxColors' in patch) {
+      setFixedPalette(null);
+      setKeep(null);
+    }
     setSettings((prev) => ({ ...prev, ...patch }));
   };
 
@@ -348,6 +377,50 @@ export default function AppPage() {
     } catch (err) {
       console.error('Failed to save trace', err);
     }
+  };
+
+  // ---- Color reduction ----
+  const appliedColors = useMemo(
+    () => (fixedPalette ?? basePalette?.map((e) => e.color) ?? []).map((c) => c.toUpperCase()),
+    [fixedPalette, basePalette],
+  );
+  const chosenColors = keep ?? appliedColors;
+  const colorsPending =
+    keep !== null &&
+    (keep.length !== appliedColors.length || keep.some((c) => !appliedColors.includes(c)));
+  const swatchTargets = useMemo(
+    () => (basePalette && chosenColors.length ? mapToNearest(basePalette.map((e) => e.color), chosenColors) : new Map<string, string>()),
+    [basePalette, chosenColors],
+  );
+  // Instant preview: recolor the current result into the chosen colors.
+  const displaySvg = useMemo(() => {
+    if (!svgResult || !colorsPending || !resultPalette) return svgResult;
+    return recolorSvg(svgResult, mapToNearest(resultPalette.map((e) => e.color), chosenColors));
+  }, [svgResult, colorsPending, resultPalette, chosenColors]);
+
+  const setColorCount = (n: number) => {
+    if (!basePalette) return;
+    setKeep(reducePalette(basePalette, n).map((c) => c.toUpperCase()));
+  };
+  const toggleColor = (color: string) => {
+    const c = color.toUpperCase();
+    if (chosenColors.includes(c)) {
+      if (chosenColors.length > 1) setKeep(chosenColors.filter((k) => k !== c));
+    } else {
+      setKeep([...chosenColors, c]);
+    }
+  };
+  const applyColors = () => {
+    if (!basePalette) return;
+    // Keeping every detected color is the same as automatic detection.
+    const all = basePalette.length === chosenColors.length && basePalette.every((e) => chosenColors.includes(e.color.toUpperCase()));
+    const ordered = basePalette.map((e) => e.color.toUpperCase()).filter((c) => chosenColors.includes(c));
+    setKeep(null);
+    setFixedPalette(all ? null : ordered);
+  };
+  const resetColors = () => {
+    setKeep(null);
+    setFixedPalette(null);
   };
 
   const baseName = () => file?.name.replace(/\.[^.]+$/, '') || 'tracemagic';
@@ -782,7 +855,7 @@ export default function AppPage() {
                         <div
                           className="absolute inset-0 m-auto [&>svg]:w-full [&>svg]:h-full"
                           style={aspect ? { aspectRatio: String(aspect), maxWidth: '100%', maxHeight: '100%' } : undefined}
-                          dangerouslySetInnerHTML={{ __html: svgResult }}
+                          dangerouslySetInnerHTML={{ __html: displaySvg ?? '' }}
                         />
                       </div>
                     </div>
@@ -849,7 +922,8 @@ export default function AppPage() {
                 </button>
                 <button
                   onClick={handleCopy}
-                  className="flex items-center gap-2 bg-white/10 hover:bg-white/20 text-white px-4 py-2.5 rounded-lg text-[10px] font-bold uppercase tracking-widest transition-colors"
+                  disabled={colorsPending}
+                  className="flex items-center gap-2 bg-white/10 hover:bg-white/20 text-white px-4 py-2.5 rounded-lg text-[10px] font-bold uppercase tracking-widest transition-colors disabled:opacity-40"
                 >
                   {copied ? <Check className="w-4 h-4 text-[#C1FF00]" /> : <Copy className="w-4 h-4" />}
                   {copied ? 'Copied' : 'Copy SVG'}
@@ -869,7 +943,7 @@ export default function AppPage() {
                   </select>
                   <button
                     onClick={handleDownloadPng}
-                    disabled={exporting === 'png'}
+                    disabled={exporting === 'png' || colorsPending}
                     title="Download a transparent PNG at the chosen width"
                     className="flex items-center gap-2 hover:bg-white/10 text-white px-3 py-2.5 text-[10px] font-bold uppercase tracking-widest transition-colors disabled:opacity-50"
                   >
@@ -878,20 +952,95 @@ export default function AppPage() {
                 </div>
                 <button
                   onClick={handleDownloadDxf}
+                  disabled={colorsPending}
                   title="Download DXF for cutters, lasers and CAD (one layer per color; Cut-outs work best)"
-                  className="flex items-center gap-2 bg-white/10 hover:bg-white/20 text-white px-4 py-2.5 rounded-lg text-[10px] font-bold uppercase tracking-widest transition-colors"
+                  className="flex items-center gap-2 bg-white/10 hover:bg-white/20 text-white px-4 py-2.5 rounded-lg text-[10px] font-bold uppercase tracking-widest transition-colors disabled:opacity-40"
                 >
                   <Scissors className="w-4 h-4" /> DXF
                 </button>
                 <button
                   onClick={handleDownload}
-                  className="flex items-center gap-2 bg-[#C1FF00] hover:bg-[#a6db00] text-black px-5 py-2.5 rounded-lg text-[10px] font-black uppercase tracking-widest transition-colors"
+                  disabled={colorsPending}
+                  title={colorsPending ? 'Apply the color changes first' : undefined}
+                  className="flex items-center gap-2 bg-[#C1FF00] hover:bg-[#a6db00] disabled:opacity-40 text-black px-5 py-2.5 rounded-lg text-[10px] font-black uppercase tracking-widest transition-colors"
                 >
                   <Download className="w-4 h-4" /> Download SVG
                 </button>
               </div>
             )}
           </div>
+
+          {/* Colors: reduce / merge the palette, preview instantly, then apply */}
+          {svgResult && basePalette && basePalette.length > 1 && settings.mode !== 'bw' && (
+            <div className="mt-4 pt-4 border-t border-white/10">
+              <div className="flex items-center justify-between gap-3 mb-2">
+                <p className="text-[10px] font-bold text-white/40 uppercase tracking-widest flex items-center gap-2">
+                  <Palette className="w-3.5 h-3.5" /> Colors · {chosenColors.length} of {basePalette.length}
+                </p>
+                {(fixedPalette || keep) && (
+                  <button
+                    onClick={resetColors}
+                    className="flex items-center gap-1.5 text-[10px] font-bold uppercase tracking-widest text-white/40 hover:text-white transition-colors"
+                  >
+                    <RotateCcw className="w-3 h-3" /> Reset
+                  </button>
+                )}
+              </div>
+              <input
+                type="range"
+                min={1}
+                max={basePalette.length}
+                value={chosenColors.length}
+                onChange={(e) => setColorCount(Number(e.target.value))}
+                className="w-full accent-[#C1FF00]"
+                aria-label="Number of colors"
+              />
+              <div className="flex flex-wrap gap-2 mt-3">
+                {basePalette.map((entry) => {
+                  const color = entry.color.toUpperCase();
+                  const kept = chosenColors.includes(color);
+                  const target = swatchTargets.get(color);
+                  const pct = entry.area * 100;
+                  return (
+                    <button
+                      key={color}
+                      onClick={() => toggleColor(color)}
+                      title={
+                        kept
+                          ? `${color} · ${pct.toFixed(1)}% — tap to merge into its nearest color`
+                          : `${color} → ${target} · tap to keep it`
+                      }
+                      className={`flex items-center gap-1.5 rounded-lg border px-1.5 py-1 transition-colors ${kept ? 'border-white/15 bg-white/5' : 'border-dashed border-white/15 opacity-60'}`}
+                    >
+                      <span className="w-6 h-6 rounded border border-white/20" style={{ background: color }} />
+                      {!kept && target && (
+                        <>
+                          <span className="text-[10px] text-white/40">→</span>
+                          <span className="w-4 h-4 rounded border border-white/20" style={{ background: target }} />
+                        </>
+                      )}
+                      <span className="text-[9px] font-mono text-white/40 pr-0.5">{pct < 0.1 ? '<0.1' : pct.toFixed(pct < 10 ? 1 : 0)}%</span>
+                    </button>
+                  );
+                })}
+              </div>
+              {colorsPending ? (
+                <button
+                  onClick={applyColors}
+                  disabled={isTracing}
+                  className="mt-3 w-full flex items-center justify-center gap-2 bg-[#C1FF00] hover:bg-[#a6db00] disabled:opacity-50 text-black py-2.5 rounded-lg text-[10px] font-black uppercase tracking-widest transition-colors"
+                >
+                  {isTracing ? <Loader2 className="w-4 h-4 animate-spin" /> : <Sparkles className="w-4 h-4" />}
+                  Apply {chosenColors.length} {chosenColors.length === 1 ? 'color' : 'colors'}
+                </button>
+              ) : null}
+              <p className="text-[9px] text-white/25 mt-2">
+                {colorsPending
+                  ? 'Previewing merged colors. Apply re-traces with exactly these colors — downloads unlock after.'
+                  : 'Slide to merge similar shades, or tap a swatch to merge it into its nearest color.'}
+              </p>
+            </div>
+          )}
         </div>
       </div>
     </div>

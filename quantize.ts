@@ -27,6 +27,8 @@ interface RawImage {
 export interface QuantizeOptions {
   /** Hard cap on palette size; null picks automatically. */
   maxColors: number | null;
+  /** Use exactly these colors (the user's chosen palette) instead of detecting one. */
+  palette?: RGB[] | null;
 }
 
 export interface QuantizeResult {
@@ -241,20 +243,23 @@ function discoverPalette(img: RawImage, blend: Uint8Array, interior: Uint8Array,
     clusters = clusters.filter((c) => c.weight > 0);
   }
 
-  const mergeInto = (big: Cluster, small: Cluster, keepColor: boolean) => {
+  /**
+   * Absorb `small` into `big`. The output color always stays big's exact
+   * color — merging never invents an in-between shade. 'pool' still moves
+   * big's comparison point (lab) toward the merged pixels, which keeps later
+   * tint detection working; 'absorb' (tints) leaves it untouched.
+   */
+  const mergeInto = (big: Cluster, small: Cluster, mode: 'pool' | 'absorb') => {
     const wsum = big.weight + small.weight;
-    if (!keepColor) {
+    if (mode === 'pool') {
       big.lab = [
         (big.lab[0] * big.weight + small.lab[0] * small.weight) / wsum,
         (big.lab[1] * big.weight + small.lab[1] * small.weight) / wsum,
         (big.lab[2] * big.weight + small.lab[2] * small.weight) / wsum,
       ];
-      big.rgbSum = [big.rgbSum[0] + small.rgbSum[0], big.rgbSum[1] + small.rgbSum[1], big.rgbSum[2] + small.rgbSum[2]];
-    } else {
-      // Keep the big color exact; just account for the absorbed pixels.
-      const f = wsum / big.weight;
-      big.rgbSum = [big.rgbSum[0] * f, big.rgbSum[1] * f, big.rgbSum[2] * f];
     }
+    const f = wsum / big.weight;
+    big.rgbSum = [big.rgbSum[0] * f, big.rgbSum[1] * f, big.rgbSum[2] * f];
     big.weight = wsum;
     big.interior += small.interior;
     clusters = clusters.filter((c) => c !== small);
@@ -272,12 +277,14 @@ function discoverPalette(img: RawImage, blend: Uint8Array, interior: Uint8Array,
     return { pair: best, d: bestD };
   };
 
-  // 1. Colors closer than the merge distance are the same ink.
+  // 1. Colors closer than the merge distance are the same ink. Merges keep
+  //    the larger color exactly (never an average), so no new shade appears
+  //    that isn't in the image.
   for (;;) {
     const { pair, d } = closestPair();
     if (!pair || d >= MERGE_DELTA_E) break;
     const [a, b] = pair[0].weight >= pair[1].weight ? pair : [pair[1], pair[0]];
-    mergeInto(a, b, false);
+    mergeInto(a, b, 'pool');
   }
 
   // 2. Satellites: a small color near a much larger one is a compression tint
@@ -292,7 +299,7 @@ function discoverPalette(img: RawImage, blend: Uint8Array, interior: Uint8Array,
       const d = tintDistance(c.lab, small.lab);
       if (d < hostD) { hostD = d; host = c; }
     }
-    if (host && hostD < SATELLITE_DELTA_E) mergeInto(host, small, true);
+    if (host && hostD < SATELLITE_DELTA_E) mergeInto(host, small, 'absorb');
   }
 
   // 3. Drop colors that don't fill any solid area (JPEG ringing, edge halos,
@@ -321,7 +328,7 @@ function discoverPalette(img: RawImage, blend: Uint8Array, interior: Uint8Array,
     }
     if (!best) break;
     const [a, b] = best[0].weight >= best[1].weight ? best : [best[1], best[0]];
-    mergeInto(a, b, false);
+    mergeInto(a, b, 'pool');
   }
 
   return clusters
@@ -375,7 +382,10 @@ export function quantizeForTrace(source: RawImage, upscaled: RawImage, options: 
   const { width: w, height: h, data } = source;
   const blend = findBlendPixels(source);
   const interior = findInteriorPixels(source);
-  const palette = discoverPalette(source, blend, interior, options.maxColors);
+  const palette =
+    options.palette && options.palette.length > 0
+      ? options.palette.slice(0, MAX_PALETTE)
+      : discoverPalette(source, blend, interior, options.maxColors);
 
   const out = Buffer.alloc(upscaled.width * upscaled.height * 4);
   if (palette.length === 0) return { data: out, palette };
