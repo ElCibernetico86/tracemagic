@@ -33,9 +33,21 @@ async function main() {
     try {
       const j = JSON.parse(text);
       if (j.svg) lastSvg = j.svg;
-      summary = j.stats ? `paths=${j.stats.paths} colors=${j.stats.colors} server=${j.stats.durationMs}ms` : JSON.stringify(j);
+      summary = j.stats
+        ? `paths=${j.stats.paths} colors=${j.stats.colors} palette=${(j.palette ?? []).map((p: any) => p.color).join(',')} server=${j.stats.durationMs}ms`
+        : JSON.stringify(j);
     } catch {}
     console.log(`${name.padEnd(14)} ${res.status} ${summary} total=${Date.now() - started}ms`);
+  }
+
+  // Fixed palette (color reduction): the result must use exactly these colors.
+  {
+    const fd = new FormData();
+    fd.append('image', new Blob([png], { type: 'image/png' }), 'badge.png');
+    fd.append('palette', JSON.stringify(['#FFFFFF', '#C8102E', '#1B2A41']));
+    const res = await call(base, fd);
+    const j = await res.json();
+    console.log(`fixed palette  ${res.status} palette=${(j.palette ?? []).map((p: any) => p.color).join(',')}`);
   }
 
   for (const width of [4500, 6000]) {
