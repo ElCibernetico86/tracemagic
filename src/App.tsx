@@ -9,12 +9,9 @@ import Footer from './components/Footer';
 import Home from './pages/Home';
 import AppPage from './pages/AppPage';
 import UpscalePage from './pages/UpscalePage';
-import Pricing from './pages/Pricing';
 import Features from './pages/Features';
 import VsPage from './pages/VsPage';
 import Blog from './pages/Blog';
-import ResultPage from './pages/ResultPage';
-import Dashboard from './pages/Dashboard';
 
 export default function App() {
   return (
@@ -26,12 +23,9 @@ export default function App() {
             <Route path="/" element={<Home />} />
             <Route path="/app" element={<AppPage />} />
             <Route path="/upscale" element={<UpscalePage />} />
-            <Route path="/pricing" element={<Pricing />} />
             <Route path="/features" element={<Features />} />
             <Route path="/blog" element={<Blog />} />
-            <Route path="/dashboard" element={<Dashboard />} />
             <Route path="/vs/:competitor" element={<VsPage />} />
-            <Route path="/r/:id" element={<ResultPage />} />
           </Routes>
         </main>
         <Footer />

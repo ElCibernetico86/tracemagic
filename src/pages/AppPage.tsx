@@ -2,7 +2,6 @@ import React, { useState, useRef, useEffect, useCallback, useMemo, ChangeEvent }
 import {
   Upload,
   Download,
-  Share2,
   Loader2,
   Sparkles,
   AlertCircle,
@@ -20,9 +19,6 @@ import {
   RotateCcw,
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
-import { collection, addDoc, serverTimestamp } from 'firebase/firestore';
-import { db, auth } from '../lib/firebase';
-import { useAuthState } from 'react-firebase-hooks/auth';
 import { useLocation, useNavigate } from 'react-router-dom';
 import { svgToDxf, svgToPng } from '../lib/exporters';
 import { downloadBlob } from '../lib/download';
@@ -160,7 +156,6 @@ export default function AppPage() {
   const [zoom, setZoom] = useState(1);
   const [pan, setPan] = useState({ x: 0, y: 0 });
 
-  const [user] = useAuthState(auth);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const canvasRef = useRef<HTMLDivElement>(null);
   const abortRef = useRef<AbortController | null>(null);
@@ -365,20 +360,6 @@ export default function AppPage() {
     handle.addEventListener('pointerup', onUp);
   };
 
-  const saveTrace = async () => {
-    if (!user || !svgResult || !file) return;
-    try {
-      await addDoc(collection(db, 'traces'), {
-        userId: user.uid,
-        fileName: file.name,
-        svg: svgResult,
-        createdAt: serverTimestamp(),
-      });
-    } catch (err) {
-      console.error('Failed to save trace', err);
-    }
-  };
-
   // ---- Color reduction ----
   const appliedColors = useMemo(
     () => (fixedPalette ?? basePalette?.map((e) => e.color) ?? []).map((c) => c.toUpperCase()),
@@ -428,7 +409,6 @@ export default function AppPage() {
   const handleDownload = () => {
     if (!svgResult) return;
     downloadBlob(new Blob([svgResult], { type: 'image/svg+xml' }), `${baseName()}-vector.svg`);
-    saveTrace();
   };
 
   const handleDownloadPng = async () => {
@@ -462,22 +442,6 @@ export default function AppPage() {
       setTimeout(() => setCopied(false), 1500);
     } catch {
       setError('Could not copy to clipboard.');
-    }
-  };
-
-  const handleShare = async () => {
-    if (!svgResult) return;
-    try {
-      const docRef = await addDoc(collection(db, 'shared_traces'), {
-        svg: svgResult,
-        createdAt: serverTimestamp(),
-        userId: user ? user.uid : 'anonymous',
-      });
-      saveTrace();
-      navigate(`/r/${docRef.id}`);
-    } catch (err) {
-      console.error('Error sharing', err);
-      setError('Failed to generate shareable link.');
     }
   };
 
@@ -913,13 +877,6 @@ export default function AppPage() {
             </div>
             {svgResult && (
               <div className="flex flex-wrap items-center gap-2">
-                <button
-                  onClick={handleShare}
-                  className="p-2.5 text-white/60 hover:text-[#C1FF00] hover:bg-white/5 rounded-lg transition-colors"
-                  title="Share"
-                >
-                  <Share2 className="w-4 h-4" />
-                </button>
                 <button
                   onClick={handleCopy}
                   disabled={colorsPending}

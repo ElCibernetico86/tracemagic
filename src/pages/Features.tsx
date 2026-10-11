@@ -30,7 +30,7 @@ export default function Features() {
             {
               icon: <Shield className="w-6 h-6 text-[#C1FF00]" />,
               title: "Private & Secure",
-              desc: "Your uploaded images are processed in memory and are never stored unless you save or share a trace."
+              desc: "Your uploaded images are processed in memory and never stored. Upscaling runs entirely on your device."
             },
             {
               icon: <Search className="w-6 h-6 text-[#C1FF00]" />,

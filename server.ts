@@ -78,19 +78,6 @@ app.post('/api/render-png', express.json({ limit: '20mb' }), async (req, res) =>
   }
 });
 
-// 3. Mock Stripe Checkout
-app.post('/api/create-checkout-session', async (req, res) => {
-  // In a real app, use the stripe SDK
-  const { priceId } = req.body;
-  console.log(`Mock checkout for price ${priceId}`);
-  // We mock a success URL
-  res.json({ url: `/dashboard?payment=success&price=${priceId}` });
-});
-
-app.post('/api/create-portal-session', async (req, res) => {
-  res.json({ url: `/dashboard?portal=success` });
-});
-
 async function startServer() {
   // Vite middleware for development
   if (process.env.NODE_ENV !== 'production') {

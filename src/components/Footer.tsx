@@ -27,7 +27,6 @@ export default function Footer() {
             <h3 className="font-black text-[11px] uppercase tracking-[1.5px] text-white mb-6">Product</h3>
             <ul className="space-y-4 text-sm text-white/60 font-medium">
               <li><Link to="/features" className="hover:text-[#C1FF00] transition-colors">Features</Link></li>
-              <li><Link to="/pricing" className="hover:text-[#C1FF00] transition-colors">Pricing</Link></li>
               <li><Link to="/app" className="hover:text-[#C1FF00] transition-colors">Try for free</Link></li>
               <li><Link to="/blog" className="hover:text-[#C1FF00] transition-colors">Changelog</Link></li>
             </ul>
