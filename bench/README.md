@@ -17,3 +17,11 @@ Upscaler (Real-ESRGAN, `public/models/realesr-general-x4v3.onnx`):
 - `npx tsx bench/upscale-check.ts` — run the model on a blurry test image (bicubic vs AI side by side).
 - `npx tsx bench/upscale-vs-direct.ts` — trace small blurry logos directly vs after a 4× AI pass.
 
+Straight edges and corners:
+- `npx tsx bench/corners.ts <file.svg>` — nicks (segments < 2px), near-level/plumb lines that aren't
+  exact, line/curve counts.
+- `npx tsx bench/local-run.ts <tag>` — trace every image in `bench/local/` (git-ignored: real logos
+  stay on this machine) and print corner + smoothness scores.
+- `npx tsx bench/zoom-file.ts <image> <out.png> <x> <y> <w> <h> <zoom> <svg...>` — zoomed crop of an
+  input image above its traced SVG(s).
+

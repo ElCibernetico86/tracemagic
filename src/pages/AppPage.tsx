@@ -40,6 +40,7 @@ interface TraceSettings {
   curveMode: CurveMode;
   stacking: ShapeStacking;
   groupByColor: boolean;
+  snapAxes: boolean;
 }
 
 interface TraceStats {
@@ -51,7 +52,7 @@ interface TraceStats {
   durationMs: number;
 }
 
-const OUTPUT_DEFAULTS = { stacking: 'stacked' as ShapeStacking, groupByColor: true };
+const OUTPUT_DEFAULTS = { stacking: 'stacked' as ShapeStacking, groupByColor: true, snapAxes: true };
 
 const PRESETS: Record<PresetId, { label: string; settings: TraceSettings }> = {
   auto: {
@@ -123,6 +124,26 @@ async function prepareUpload(file: File): Promise<Blob> {
 
 /** PNG export widths; 4500 is the usual print-on-demand canvas width. */
 const PNG_WIDTHS = [1000, 2000, 4500, 6000];
+
+function ToggleRow({ label, hint, on, onToggle }: { label: string; hint: string; on: boolean; onToggle: () => void }) {
+  return (
+    <div className="flex items-center justify-between gap-3 mt-4">
+      <div>
+        <p className="text-[10px] font-bold text-white/40 uppercase tracking-widest">{label}</p>
+        <p className="text-[9px] text-white/25 mt-0.5">{hint}</p>
+      </div>
+      <button
+        onClick={onToggle}
+        role="switch"
+        aria-checked={on}
+        aria-label={label}
+        className={`relative w-11 h-6 rounded-full transition-colors flex-shrink-0 ${on ? 'bg-[#C1FF00]' : 'bg-white/10'}`}
+      >
+        <span className={`absolute top-0.5 w-5 h-5 rounded-full bg-white shadow transition-all ${on ? 'left-[22px] bg-black' : 'left-0.5'}`} />
+      </button>
+    </div>
+  );
+}
 
 function formatKb(bytes: number) {
   return `${(bytes / 1024).toFixed(1)} KB`;
@@ -234,6 +255,7 @@ export default function AppPage() {
     formData.append('curveMode', settings.curveMode);
     formData.append('stacking', settings.stacking);
     formData.append('groupByColor', String(settings.groupByColor));
+    formData.append('snapAxes', String(settings.snapAxes));
     if (fixedPalette) formData.append('palette', JSON.stringify(fixedPalette));
 
     try {
@@ -297,6 +319,7 @@ export default function AppPage() {
       ...PRESETS[id].settings,
       stacking: prev.stacking,
       groupByColor: prev.groupByColor,
+      snapAxes: prev.snapAxes,
     }));
   };
 
@@ -669,22 +692,18 @@ export default function AppPage() {
                   : 'Colors never overlap — best for cut files and screen printing.'}
               </p>
 
-              <div className="flex items-center justify-between">
-                <div>
-                  <p className="text-[10px] font-bold text-white/40 uppercase tracking-widest">Group by Color</p>
-                  <p className="text-[9px] text-white/25 mt-0.5">One named group per color in the SVG (DXF always uses one layer per color).</p>
-                </div>
-                <button
-                  onClick={() =>
-                    updateSettings({ groupByColor: !settings.groupByColor })
-                  }
-                  className={`relative w-11 h-6 rounded-full transition-colors flex-shrink-0 ${settings.groupByColor ? 'bg-[#C1FF00]' : 'bg-white/10'}`}
-                >
-                  <span
-                    className={`absolute top-0.5 w-5 h-5 rounded-full bg-white shadow transition-all ${settings.groupByColor ? 'left-[22px] bg-black' : 'left-0.5'}`}
-                  />
-                </button>
-              </div>
+              <ToggleRow
+                label="Group by Color"
+                hint="One named group per color in the SVG (DXF always uses one layer per color)."
+                on={settings.groupByColor}
+                onToggle={() => updateSettings({ groupByColor: !settings.groupByColor })}
+              />
+              <ToggleRow
+                label="Snap Level & Plumb"
+                hint="Straight edges within 2° of horizontal or vertical become exactly level or plumb."
+                on={settings.snapAxes}
+                onToggle={() => updateSettings({ snapAxes: !settings.snapAxes })}
+              />
             </div>
           </div>
         </div>

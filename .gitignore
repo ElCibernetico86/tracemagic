@@ -11,3 +11,4 @@ coverage/
 .vercel
 .claude/settings.local.json
 bench/out/
+bench/local/

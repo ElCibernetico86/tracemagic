@@ -33,6 +33,8 @@ export interface RefineOptions {
   curves?: boolean;
   /** Input is a pixel-staircase outline; smooth the steps before fitting. */
   staircase?: boolean;
+  /** Snap straight edges within 2° of horizontal/vertical exactly onto it (default true). */
+  snapAxes?: boolean;
 }
 
 const round = (n: number) => Math.round(n * 100) / 100;
@@ -219,40 +221,76 @@ function walkVertex(pts: Point[], idx: number, targetDist: number, dir: 1 | -1, 
 }
 
 /**
- * Reconstruct the true corner position by intersecting the tangents of the
- * two edges entering the rounded cluster — the tracer clips sharp tips into
- * small arcs, and this puts the point back.
+ * Least-squares line through the samples along one edge of a corner,
+ * starting `skip` px from `idx` and walking up to `reach` px in `dir`.
+ * The direction points toward the corner.
+ */
+function armLine(pts: Point[], idx: number, dir: 1 | -1, reach: number, closed: boolean, skip = 0.5) {
+  const n = pts.length;
+  const sel: Point[] = [];
+  let cur = idx;
+  let walked = 0;
+  for (let s = 0; s < n; s++) {
+    let next = cur + dir;
+    if (closed) next = ((next % n) + n) % n;
+    else if (next < 0 || next >= n) break;
+    walked += dist(pts[cur], pts[next]);
+    cur = next;
+    if (walked > reach) break;
+    if (walked >= skip) sel.push(pts[cur]);
+  }
+  if (sel.length < 2) return null;
+  let cx = 0, cy = 0;
+  for (const p of sel) { cx += p.x; cy += p.y; }
+  cx /= sel.length; cy /= sel.length;
+  let sxx = 0, syy = 0, sxy = 0;
+  for (const p of sel) {
+    const dx = p.x - cx, dy = p.y - cy;
+    sxx += dx * dx; syy += dy * dy; sxy += dx * dy;
+  }
+  const angle = 0.5 * Math.atan2(2 * sxy, sxx - syy);
+  let ux = Math.cos(angle), uy = Math.sin(angle);
+  // Orient toward the corner: from the far samples to the near ones.
+  const far = sel[sel.length - 1], near = sel[0];
+  if ((near.x - far.x) * ux + (near.y - far.y) * uy < 0) { ux = -ux; uy = -uy; }
+  return { c: { x: cx, y: cy }, u: { x: ux, y: uy } };
+}
+
+/** Intersection of two lines given as point + direction; null when (nearly) parallel. */
+function intersectLines(a: { c: Point; u: Point }, b: { c: Point; u: Point }): Point | null {
+  const det = a.u.x * b.u.y - a.u.y * b.u.x;
+  if (Math.abs(det) < Math.sin((6 * Math.PI) / 180)) return null; // < ~6°: no reliable corner
+  const t = ((b.c.x - a.c.x) * b.u.y - (b.c.y - a.c.y) * b.u.x) / det;
+  return { x: a.c.x + t * a.u.x, y: a.c.y + t * a.u.y };
+}
+
+/**
+ * Reconstruct the true corner position: fit a straight line to each edge
+ * leading into the (smoothing-rounded) corner and intersect them. Fitting
+ * many samples, not two, keeps the corner from landing off target.
  */
 function restoreCorner(
   pts: Point[],
   cluster: CornerCluster,
   closed: boolean,
-  /** How far along each edge to sample its direction (px); kept short of the neighboring corners. */
+  /** How far along each edge to sample (px); kept short of the neighboring corners. */
   reachBefore = 3,
   reachAfter = 3,
+  /** Furthest the restored corner may sit from the detected one (px). */
+  maxShift = 4,
 ): Point | null {
   if (reachBefore < 1.5 || reachAfter < 1.5) return null;
-  const a1 = walkVertex(pts, cluster.from, 0.5, -1, closed);
-  const a2 = walkVertex(pts, cluster.from, reachBefore, -1, closed);
-  const b1 = walkVertex(pts, cluster.to, 0.5, 1, closed);
-  const b2 = walkVertex(pts, cluster.to, reachAfter, 1, closed);
-  if (!a1 || !a2 || !b1 || !b2) return null;
-
-  const dax = a1.x - a2.x;
-  const day = a1.y - a2.y;
-  const dbx = b1.x - b2.x;
-  const dby = b1.y - b2.y;
-  const det = dax * dby - day * dbx;
-  if (Math.abs(det) < 1e-6) return null;
-
-  const t = ((b1.x - a1.x) * dby - (b1.y - a1.y) * dbx) / det;
-  if (t < 0) return null; // lines meet behind the edge: not a convex corner
-  const ix = a1.x + t * dax;
-  const iy = a1.y + t * day;
-
+  const a = armLine(pts, cluster.from, -1, reachBefore, closed);
+  const b = armLine(pts, cluster.to, 1, reachAfter, closed);
+  if (!a || !b) return null;
+  const p = intersectLines(a, b);
+  if (!p) return null;
+  // The corner must lie ahead of both edges (where they're heading).
+  if ((p.x - a.c.x) * a.u.x + (p.y - a.c.y) * a.u.y < 0) return null;
+  if ((p.x - b.c.x) * b.u.x + (p.y - b.c.y) * b.u.y < 0) return null;
   const apexPt = pts[cluster.apex];
-  if (Math.hypot(ix - apexPt.x, iy - apexPt.y) > 4) return null; // implausibly far: nearly parallel edges
-  return { x: ix, y: iy };
+  if (Math.hypot(p.x - apexPt.x, p.y - apexPt.y) > maxShift) return null;
+  return p;
 }
 
 /**
@@ -852,6 +890,98 @@ function smoothAlong(pts: Point[], sigmaSamples: number, closed: boolean): Point
   return out;
 }
 
+/**
+ * Straight-edge test that tolerates specks: the edge is a line when at least
+ * 80% of its samples sit tightly on one line and the rest stray only a little
+ * (a speck or bump in the source, not a curve — on a curve most samples are
+ * off any line). The line is fitted to the tight samples only.
+ */
+function robustLine(run: Point[], noise: number, thickness: number): { c: Point; u: Point } | null {
+  // Half-pixel steps are noise on big shapes, not on small text.
+  const tight = Math.max(0.35 + 2 * noise, Math.min(0.6, 0.02 * thickness));
+  const maxStray = Math.max(1.5, Math.min(3, 0.06 * thickness));
+  // Big shapes tolerate more speckle (up to 30%); thin text stays strict.
+  const minInliers = thickness >= 8 ? 0.7 : 0.8;
+  let line = lineQuality(run, 0, run.length - 1);
+  for (let pass = 0; pass < 2; pass++) {
+    const res = run.map((p) => Math.abs((p.x - line.cx) * -line.uy + (p.y - line.cy) * line.ux));
+    const inliers = run.filter((_, i) => res[i] <= tight);
+    if (inliers.length < Math.max(3, minInliers * run.length)) return null;
+    if (Math.max(...res) > maxStray) return null;
+    line = lineQuality(inliers, 0, inliers.length - 1);
+  }
+  // Final check on the refit line.
+  const inliers = run.filter((p) => Math.abs((p.x - line.cx) * -line.uy + (p.y - line.cy) * line.ux) <= tight);
+  if (inliers.length < minInliers * run.length) return null;
+  return { c: { x: line.cx, y: line.cy }, u: { x: line.ux, y: line.uy } };
+}
+
+/**
+ * Corners found from straight edges (Potrace-style): long straight stretches
+ * of the outline, separated by a short messy gap and pointing clearly
+ * different ways, meet in a corner at the intersection of their lines —
+ * whatever specks or rounding sit in the gap are ignored. Returns, per corner,
+ * the gap's sample range and the corner point. Indices refer to `pts`.
+ */
+function linePairCorners(pts: Point[], closed: boolean, noise: number, minLen: number, maxGap: number, minTurnDeg: number, step: number) {
+  const n = pts.length;
+  if (n < 8) return [];
+  // Scan from a sample that is unlikely to be mid-edge: the sharpest turn.
+  let start = 0;
+  if (closed) {
+    let best = -1;
+    for (let i = 0; i < n; i++) {
+      const t = turnK(pts, i, Math.max(2, Math.round(2 / step)), true);
+      if (t > best) { best = t; start = i; }
+    }
+  }
+  const seq = closed ? [...pts.slice(start), ...pts.slice(0, start)] : pts;
+  const toOrig = (i: number) => (closed ? (i + start) % n : i);
+
+  // Greedy maximal straight stretches (doubling + binary search on the end).
+  const stretches: { a: number; b: number }[] = [];
+  let i = 0;
+  while (i < n - 1) {
+    let j = i + 1;
+    while (j < n - 1 && dist(seq[i], seq[j]) < minLen) j++;
+    if (dist(seq[i], seq[j]) < minLen || !isLineLike(seq, i, j, noise)) { i++; continue; }
+    let lo = j, hi = -1;
+    for (let stepK = 2; lo < n - 1; stepK *= 2) {
+      const k = Math.min(lo + stepK, n - 1);
+      if (isLineLike(seq, i, k, noise)) lo = k; else { hi = k; break; }
+    }
+    if (hi > 0) while (hi - lo > 1) { const mid = (lo + hi) >> 1; if (isLineLike(seq, i, mid, noise)) lo = mid; else hi = mid; }
+    stretches.push({ a: i, b: lo });
+    i = lo + 1;
+  }
+  const fit = (st: { a: number; b: number }) => {
+    const q = lineQuality(seq, st.a, st.b);
+    // Orient along the outline direction.
+    let ux = q.ux, uy = q.uy;
+    if ((seq[st.b].x - seq[st.a].x) * ux + (seq[st.b].y - seq[st.a].y) * uy < 0) { ux = -ux; uy = -uy; }
+    return { c: { x: q.cx, y: q.cy }, u: { x: ux, y: uy } };
+  };
+  const out: { from: number; to: number; point: Point }[] = [];
+  const pairs = stretches.length;
+  for (let k = 0; k < (closed ? pairs : pairs - 1); k++) {
+    const A = stretches[k], B = stretches[(k + 1) % pairs];
+    if (A === B) continue;
+    const gap = closed ? ((B.a - A.b + n) % n) : B.a - A.b;
+    if (gap * step > maxGap) continue;
+    // A real corner's edges are long next to the messy gap between them.
+    if ((A.b - A.a) < 2 * gap || (B.b - B.a) < 2 * gap) continue;
+    const la = fit(A), lb = fit(B);
+    const turn = (Math.acos(Math.max(-1, Math.min(1, la.u.x * lb.u.x + la.u.y * lb.u.y))) * 180) / Math.PI;
+    if (turn < minTurnDeg || turn > 170) continue;
+    const p = intersectLines(la, lb);
+    if (!p) continue;
+    const mid = seq[(A.b + Math.floor(gap / 2)) % n];
+    if (dist(p, mid) > maxGap + 2) continue;
+    out.push({ from: toOrig(A.b), to: toOrig((A.b + gap) % n), point: p });
+  }
+  return out;
+}
+
 /** Re-sample a polyline at uniform arc-length spacing. */
 function resample(pts: Point[], closed: boolean, step: number): Point[] {
   const src = closed ? [...pts, pts[0]] : pts;
@@ -926,12 +1056,14 @@ function turnK(pts: Point[], i: number, k: number, closed: boolean): number {
  * small-scale turn is only half the large-scale one. That separates corners
  * from small rounded features and from edge noise.
  */
-function detectCorners(pts: Point[], closed: boolean, cornerDeg: number, step: number) {
+function detectCorners(pts: Point[], closed: boolean, cornerDeg: number, step: number, scalePx: number) {
   const n = pts.length;
-  // Scales are small enough for 2px letter strokes; edge noise is already
-  // removed by the raster boundary smoothing.
-  const kBig = Math.max(2, Math.round(1.5 / step));
-  const kSmall = Math.max(1, Math.round(0.75 / step));
+  // Turns are measured over `scalePx` (and half of it for the scale check).
+  // The scale follows the shape's stroke thickness: 2px letter strokes need
+  // ~1.5px, big shapes need more so a slightly soft corner still reads as a
+  // corner and a half-pixel bump on a long edge doesn't.
+  const kBig = Math.max(2, Math.round(scalePx / step));
+  const kSmall = Math.max(1, Math.round(scalePx / 2 / step));
   const big = new Float64Array(n);
   if (n < 2 * kBig + 2) return { corners: [] as number[], big, kSmall, kBig };
   for (let i = 0; i < n; i++) big[i] = turnK(pts, i, kBig, closed);
@@ -964,7 +1096,7 @@ function detectCorners(pts: Point[], closed: boolean, cornerDeg: number, step: n
   return { corners, big, kSmall, kBig };
 }
 
-function rebuildSubpath(sub: Subpath, maxError: number, cornerDeg: number, outlineSigma: number): string | null {
+function rebuildSubpath(sub: Subpath, maxError: number, cornerDeg: number, outlineSigma: number, snapAxes: boolean): string | null {
   const STEP = 0.5;
   let pts = sub.points;
 
@@ -1002,14 +1134,68 @@ function rebuildSubpath(sub: Subpath, maxError: number, cornerDeg: number, outli
   const kept = moves.slice(0, Math.max(1, Math.floor(moves.length * 0.9)));
   const noise = Math.sqrt(kept.reduce((sum, m) => sum + m * m, 0) / kept.length);
 
-  const detected = detectCorners(pts, sub.closed, cornerDeg, STEP);
+  // Stroke thickness ≈ 2·area / perimeter (exact for a long, even stroke).
+  // Corner scale follows it: big letters get a bigger window than tiny text.
+  let perimeter = 0;
+  for (let i = 1; i < n; i++) perimeter += dist(pts[i - 1], pts[i]);
+  const thickness = sub.closed && perimeter > 0 ? (2 * Math.abs(signedArea(pts))) / perimeter : 0;
+  const cornerScale = Math.min(5, Math.max(1.5, thickness * 0.12));
+  const reach = thickness < 8 ? 3 : Math.min(12, Math.max(3, 3 * cornerScale));
+  // How far a rebuilt corner may move from the outline. Where thin strokes
+  // meet at sharp angles (the N's diagonal), extending the edges to their
+  // intersection would make long spikes; on thin shapes keep it short.
+  const maxCornerShift = thickness < 8 ? Math.max(1, 0.6 * thickness) : Math.max(4, 2 * cornerScale);
+
+  const detected = detectCorners(pts, sub.closed, cornerDeg, STEP, cornerScale);
   let cornerIdx = detected.corners;
+  // On thick shapes, a real corner still turns when viewed over twice the
+  // window; a speck on a straight edge doesn't. (Thin text keeps every
+  // corner: its features are too close together for a wider window.)
+  if (thickness >= 8) {
+    // Compare straight-line fits of the edge on each side (4–10px): a zigzag
+    // on a straight edge leaves both sides pointing the same way.
+    const half = Math.max(4, Math.min(10, 0.4 * thickness));
+    cornerIdx = cornerIdx.filter((c) => {
+      const before = armLine(pts, c, -1, half, sub.closed, 0.5);
+      const after = armLine(pts, c, 1, half, sub.closed, 0.5);
+      if (!before || !after) return true;
+      // before.u points toward the corner (along the outline); after.u points back toward it.
+      const cos = -(before.u.x * after.u.x + before.u.y * after.u.y);
+      const turn = (Math.acos(Math.max(-1, Math.min(1, cos))) * 180) / Math.PI;
+      return turn >= 0.6 * cornerDeg;
+    });
+  }
+
+  // Corners from straight edges catch soft or speckled corners the turn
+  // detector misses; detected corners inside such a gap or along a straight
+  // stretch's middle are replaced by them.
+  // Only on thick shapes: small text corners are handled well by the turn
+  // detector, and its short edges would let curves pass as line pairs.
+  const pairCorners =
+    thickness >= 8
+      ? linePairCorners(pts, sub.closed, noise, Math.max(10, Math.min(24, 0.8 * thickness)), Math.min(12, Math.max(4, 0.4 * thickness)), 20, STEP)
+      : [];
+  const inGap = (i: number, g: { from: number; to: number }) =>
+    g.from <= g.to ? i >= g.from - 2 && i <= g.to + 2 : i >= g.from - 2 || i <= g.to + 2;
+  const pairApex = pairCorners.map((g) => {
+    const len = g.from <= g.to ? g.to - g.from : g.to + n - g.from;
+    return (g.from + Math.floor(len / 2)) % n;
+  });
+  const pairPoint = new Map<number, { from: number; to: number; point: Point }>();
+  pairCorners.forEach((g, k) => pairPoint.set(pairApex[k], g));
+  cornerIdx = [...cornerIdx.filter((c) => !pairCorners.some((g) => inGap(c, g))), ...pairApex].sort((a, b) => a - b);
 
   if (sub.closed && cornerIdx.length > 0) {
     // Start the loop at a corner so no corner zone straddles the seam.
     const c0 = cornerIdx[0];
     pts = [...pts.slice(c0), ...pts.slice(0, c0)];
     cornerIdx = cornerIdx.map((c) => (c - c0 + n) % n).sort((a, b) => a - b);
+    const remapped = new Map<number, { from: number; to: number; point: Point }>();
+    for (const [apex, g] of pairPoint) {
+      remapped.set((apex - c0 + n) % n, { from: (g.from - c0 + n) % n, to: (g.to - c0 + n) % n, point: g.point });
+    }
+    pairPoint.clear();
+    for (const [k, v] of remapped) pairPoint.set(k, v);
   }
 
   // Each corner replaces a short zone (rounded by smoothing) with the
@@ -1019,9 +1205,20 @@ function rebuildSubpath(sub: Subpath, maxError: number, cornerDeg: number, outli
   const gapPx = (a: number, b: number) => (((b - a + n) % n) || n) * STEP; // samples a→b, forward
   // A U-turn spans more than the detection window on thin strokes, so judge
   // it over twice the distance.
-  const isCap = cornerIdx.map((c) => turnK(pts, c, 2 * detected.kBig, sub.closed) >= 150);
+  const isCap = cornerIdx.map((c) => !pairPoint.has(c) && turnK(pts, c, 2 * detected.kBig, sub.closed) >= 150);
   const zoneSize = isCap.map((cap) => (cap ? detected.kBig : detected.kSmall));
+  // Line-pair corners replace their whole gap (asymmetric around the apex).
+  const zoneBefore = cornerIdx.map((c, j) => {
+    const g = pairPoint.get(c);
+    return g ? (c - g.from + n) % n : zoneSize[j];
+  });
+  const zoneAfter = cornerIdx.map((c, j) => {
+    const g = pairPoint.get(c);
+    return g ? (g.to - c + n) % n : zoneSize[j];
+  });
   const restored = cornerIdx.map((c, j): Point[] => {
+    const pair = pairPoint.get(c);
+    if (pair) return [pair.point];
     const zs = zoneSize[j];
     const from = sub.closed ? (c - zs + n) % n : Math.max(0, c - zs);
     const to = sub.closed ? (c + zs) % n : Math.min(n - 1, c + zs);
@@ -1037,14 +1234,14 @@ function rebuildSubpath(sub: Subpath, maxError: number, cornerDeg: number, outli
       const cap = squareCap(pts, cluster, sub.closed, Math.min(3, before), Math.min(3, after));
       if (cap) return cap;
     }
-    const corner = restoreCorner(pts, cluster, sub.closed, Math.min(3, before), Math.min(3, after));
+    const corner = restoreCorner(pts, cluster, sub.closed, Math.min(reach, before), Math.min(reach, after), maxCornerShift);
     if (corner) return [corner];
     // Near-parallel sides make the corner unrecoverable; a cap beats a spike.
     return squareCap(pts, cluster, sub.closed, Math.min(3, before), Math.min(3, after)) ?? [pts[c]];
   });
   const zoneOf = new Int32Array(n).fill(-1);
   cornerIdx.forEach((c, j) => {
-    for (let d = -zoneSize[j]; d <= zoneSize[j]; d++) {
+    for (let d = -zoneBefore[j]; d <= zoneAfter[j]; d++) {
       let i = c + d;
       if (sub.closed) i = ((i % n) + n) % n;
       else if (i < 0 || i >= n) continue;
@@ -1103,6 +1300,91 @@ function rebuildSubpath(sub: Subpath, maxError: number, cornerDeg: number, outli
     pts = out;
   }
 
+  // Straight corner-to-corner edges become exact lines (least-squares fit).
+  // Where two lines meet, the corner is their intersection; near-level and
+  // near-plumb lines snap exactly level/plumb. This is what makes lettering
+  // and other straight-edged shapes come out crisp.
+  const runCount = corners.length - 1;
+  const lineOf: ({ c: Point; u: Point } | null)[] = [];
+  // Snap within 2°, or within ~1.5px of drift over the edge's length for
+  // short edges, whose fitted direction is less certain.
+  const snapDir = (u: Point, lengthPx = Infinity): Point => {
+    if (!snapAxes) return u;
+    const deg = (Math.atan2(u.y, u.x) * 180) / Math.PI;
+    const nearest = Math.round(deg / 90) * 90;
+    const limit = Math.max(2, (Math.atan(1.5 / Math.max(lengthPx, 1)) * 180) / Math.PI);
+    if (Math.abs(deg - nearest) >= limit) return u;
+    const r = (nearest * Math.PI) / 180;
+    return { x: Math.round(Math.cos(r)), y: Math.round(Math.sin(r)) };
+  };
+  const fitLine = (samples: Point[]) => {
+    const q = lineQuality(samples, 0, samples.length - 1);
+    return { c: { x: q.cx, y: q.cy }, u: snapDir({ x: q.ux, y: q.uy }, (samples.length - 1) * STEP) };
+  };
+  for (let s = 0; s < runCount; s++) {
+    const run = pts.slice(corners[s], corners[s + 1] + 1);
+    if ((smoothSeam && runCount === 1) || run.length < 3) {
+      lineOf.push(null);
+      continue;
+    }
+    // Judge straightness on the middle of the edge: its ends are where soft
+    // or slightly misplaced corners bend it. The corners get rebuilt from
+    // the line itself afterwards.
+    const len = (run.length - 1) * STEP;
+    const trim = Math.min(0.2 * len, Math.max(2, 1.5 * cornerScale));
+    const k0 = Math.round(trim / STEP);
+    const k1 = run.length - 1 - k0;
+    const middle = run.slice(k0, k1 + 1);
+    const line = middle.length >= 3 && (k1 - k0) * STEP >= 4 ? robustLine(middle, noise, thickness) : null;
+    if (!line) {
+      lineOf.push(null);
+      continue;
+    }
+    line.u = snapDir(line.u, len);
+    // The run's ends must still be near that line, or this is a line that
+    // turns into a curve (not a straight edge between two corners).
+    const off = (p: Point) => Math.abs((p.x - line.c.x) * -line.u.y + (p.y - line.c.y) * line.u.x);
+    if (off(run[0]) > Math.max(2, cornerScale) || off(run[run.length - 1]) > Math.max(2, cornerScale)) {
+      lineOf.push(null);
+      continue;
+    }
+    lineOf.push(line);
+  }
+  // Two neighboring lines pointing the same way (< 6°) meet at a fake corner
+  // (a speck on a straight edge): merge them into one line.
+  for (let j = sub.closed ? 0 : 1; j < runCount; j++) {
+    const a = (j - 1 + runCount) % runCount;
+    const prev = lineOf[a], next = lineOf[j];
+    if (!prev || !next || prev === next) continue;
+    if (Math.abs(prev.u.x * next.u.y - prev.u.y * next.u.x) >= Math.sin((6 * Math.PI) / 180)) continue;
+    const merged = fitLine([...pts.slice(corners[a], corners[a + 1] + 1), ...pts.slice(corners[j], corners[j + 1] + 1)]);
+    for (let r = 0; r < runCount; r++) if (lineOf[r] === prev || lineOf[r] === next) lineOf[r] = merged;
+  }
+  const project = (p: Point, l: { c: Point; u: Point }) => {
+    const t = (p.x - l.c.x) * l.u.x + (p.y - l.c.y) * l.u.y;
+    return { x: l.c.x + t * l.u.x, y: l.c.y + t * l.u.y };
+  };
+  // Corner j joins run j−1 and run j (for closed paths, corner 0 joins the last run and run 0).
+  for (let j = sub.closed ? 0 : 1; j < (sub.closed ? runCount : runCount); j++) {
+    const prev = lineOf[(j - 1 + runCount) % runCount];
+    const next = lineOf[j];
+    const idx = corners[j];
+    let p: Point | null = null;
+    if (prev && next) {
+      const hit = intersectLines(prev, next);
+      if (hit && dist(hit, pts[idx]) <= maxCornerShift) p = hit;
+    }
+    if (!p && (prev || next)) {
+      const line = (prev ?? next)!;
+      const onLine = project(pts[idx], line);
+      if (dist(onLine, pts[idx]) <= 1.5) p = onLine;
+    }
+    if (p) {
+      pts[idx] = p;
+      if (sub.closed && j === 0) pts[pts.length - 1] = p;
+    }
+  }
+
   // A closed loop with no corners is cut at an arbitrary point: give both
   // sides of the cut the same tangent so the seam is invisible.
   let seamTan: Point | null = null;
@@ -1114,6 +1396,11 @@ function rebuildSubpath(sub: Subpath, maxError: number, cornerDeg: number, outli
 
   let d = `M${round(pts[0].x)} ${round(pts[0].y)}`;
   for (let s = 0; s + 1 < corners.length; s++) {
+    if (lineOf[s]) {
+      const end = pts[corners[s + 1]];
+      d += `L${round(end.x)} ${round(end.y)}`;
+      continue;
+    }
     const isFirst = s === 0;
     const isLast = s + 2 === corners.length;
     const piece = fitRunWithLines(
@@ -1205,7 +1492,7 @@ export function refineTracedSvg(svg: string, options: RefineOptions): string {
           out += polylineD(sub);
           continue;
         }
-        const rebuilt = rebuildSubpath(sub, maxError, cornerDeg, outlineSigma);
+        const rebuilt = rebuildSubpath(sub, maxError, cornerDeg, outlineSigma, options.snapAxes ?? true);
         out += rebuilt ?? polylineD(sub);
       }
       return tag

@@ -36,6 +36,8 @@ export interface TraceOptions {
   curveMode: CurveMode;
   stacking: ShapeStacking;
   groupByColor: boolean;
+  /** Snap straight edges within 2° of level/plumb exactly onto it. */
+  snapAxes: boolean;
   /** Fixed palette chosen by the user (color reduction); null = detect. */
   palette: RGB[] | null;
 }
@@ -82,7 +84,8 @@ export function parseTraceOptions(body: Record<string, unknown>): TraceOptions {
   const groupByColor = !(body.groupByColor === 'false' || body.groupByColor === false);
   const stacking: ShapeStacking = body.stacking === 'cutout' ? 'cutout' : 'stacked';
 
-  return { mode, maxColors, detail, smoothness, curveMode, stacking, groupByColor, palette: parsePalette(body.palette) };
+  const snapAxes = !(body.snapAxes === 'false' || body.snapAxes === false);
+  return { mode, maxColors, detail, smoothness, curveMode, stacking, groupByColor, snapAxes, palette: parsePalette(body.palette) };
 }
 
 function buildVectorizerConfig(options: TraceOptions, scale: number) {
@@ -414,6 +417,7 @@ export async function traceImage(
       height: pre.height,
       curves: options.curveMode === 'spline',
       staircase: options.curveMode === 'spline',
+      snapAxes: options.snapAxes,
     });
     debug?.('refined', svg, toHex(color));
 
