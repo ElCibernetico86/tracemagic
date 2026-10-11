@@ -12,3 +12,8 @@
 - `npx tsx bench/dump-quant.ts <image> <out.png>` — save the quantized trace-resolution image.
 
 Run these after any change to `quantize.ts`, `trace-postprocess.ts` or `trace-pipeline.ts`.
+
+Upscaler (Real-ESRGAN, `public/models/realesr-general-x4v3.onnx`):
+- `npx tsx bench/upscale-check.ts` — run the model on a blurry test image (bicubic vs AI side by side).
+- `npx tsx bench/upscale-vs-direct.ts` — trace small blurry logos directly vs after a 4× AI pass.
+

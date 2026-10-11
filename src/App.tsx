@@ -8,6 +8,7 @@ import Header from './components/Header';
 import Footer from './components/Footer';
 import Home from './pages/Home';
 import AppPage from './pages/AppPage';
+import UpscalePage from './pages/UpscalePage';
 import Pricing from './pages/Pricing';
 import Features from './pages/Features';
 import VsPage from './pages/VsPage';
@@ -24,6 +25,7 @@ export default function App() {
           <Routes>
             <Route path="/" element={<Home />} />
             <Route path="/app" element={<AppPage />} />
+            <Route path="/upscale" element={<UpscalePage />} />
             <Route path="/pricing" element={<Pricing />} />
             <Route path="/features" element={<Features />} />
             <Route path="/blog" element={<Blog />} />

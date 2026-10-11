@@ -32,6 +32,8 @@ export default function Header() {
 
           {/* Desktop Nav */}
           <nav className="hidden md:flex items-center gap-8 text-[11px] font-bold text-white/60 uppercase tracking-[1.5px]">
+            <Link to="/app" className="hover:text-white transition-colors">Trace</Link>
+            <Link to="/upscale" className="hover:text-white transition-colors">Upscale</Link>
             <Link to="/features" className="hover:text-white transition-colors">Features</Link>
             <Link to="/pricing" className="hover:text-white transition-colors">Pricing</Link>
             <Link to="/blog" className="hover:text-white transition-colors">Blog</Link>
@@ -73,6 +75,8 @@ export default function Header() {
       {isOpen && (
         <div className="md:hidden border-t border-white/10 bg-[#050505]">
           <div className="px-4 py-6 flex flex-col gap-4 text-[11px] font-bold uppercase tracking-[1.5px]">
+            <Link to="/app" onClick={() => setIsOpen(false)} className="text-white/60 hover:text-white">Trace</Link>
+            <Link to="/upscale" onClick={() => setIsOpen(false)} className="text-white/60 hover:text-white">Upscale</Link>
             <Link to="/features" onClick={() => setIsOpen(false)} className="text-white/60 hover:text-white">Features</Link>
             <Link to="/pricing" onClick={() => setIsOpen(false)} className="text-white/60 hover:text-white">Pricing</Link>
             <Link to="/blog" onClick={() => setIsOpen(false)} className="text-white/60 hover:text-white">Blog</Link>

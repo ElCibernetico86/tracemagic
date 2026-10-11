@@ -21,8 +21,9 @@ import { motion, AnimatePresence } from 'motion/react';
 import { collection, addDoc, serverTimestamp } from 'firebase/firestore';
 import { db, auth } from '../lib/firebase';
 import { useAuthState } from 'react-firebase-hooks/auth';
-import { useNavigate } from 'react-router-dom';
+import { useLocation, useNavigate } from 'react-router-dom';
 import { svgToDxf, svgToPng } from '../lib/exporters';
+import { downloadBlob } from '../lib/download';
 
 type TraceMode = 'color' | 'grayscale' | 'bw';
 type CurveMode = 'spline' | 'polygon' | 'pixel';
@@ -124,17 +125,6 @@ async function prepareUpload(file: File): Promise<Blob> {
 /** PNG export widths; 4500 is the usual print-on-demand canvas width. */
 const PNG_WIDTHS = [1000, 2000, 4500, 6000];
 
-function downloadBlob(blob: Blob, filename: string) {
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = filename;
-  document.body.appendChild(a);
-  a.click();
-  document.body.removeChild(a);
-  URL.revokeObjectURL(url);
-}
-
 function formatKb(bytes: number) {
   return `${(bytes / 1024).toFixed(1)} KB`;
 }
@@ -183,6 +173,17 @@ export default function AppPage() {
     setPan({ x: 0, y: 0 });
     hasTracedRef.current = false;
   };
+
+  // An image handed over from the Upscale page arrives in navigation state.
+  const location = useLocation();
+  useEffect(() => {
+    const incoming = (location.state as { file?: File } | null)?.file;
+    if (incoming instanceof File) {
+      acceptFile(incoming);
+      navigate(location.pathname, { replace: true, state: null });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [location.state]);
 
   const handleFileChange = (e: ChangeEvent<HTMLInputElement>) => {
     const selected = e.target.files?.[0];

@@ -1,8 +1,13 @@
 # TraceMagic
 
 Raster → vector tracer tuned for logos: exact color palettes, sharp corners, straight
-lines, perfect circles, and clean results from compressed JPGs. Exports SVG,
-high-resolution transparent PNG, and DXF (one layer per color).
+lines, perfect circles, and clean results from compressed JPGs. Exports SVG (one named
+group per color), high-resolution transparent PNG, and DXF (one layer per color).
+
+Also includes an AI upscaler (`/upscale`): Real-ESRGAN general-x4v3 (BSD-3, ONNX export from
+huggingface.co/jonathanst29/tinier-upscale-models) running in the browser via onnxruntime-web —
+WebGPU when available, WebAssembly otherwise. Images never leave the device. Small or blurry
+logos trace far more accurately after a 4× pass (see `bench/upscale-vs-direct.ts`).
 
 ## Run locally
 
