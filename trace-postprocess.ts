@@ -658,12 +658,27 @@ function fitRunWithLines(
       i++;
       continue;
     }
-    // Grow; look past a local bump before giving up on the line.
-    for (;;) {
-      const next = [j + 2, j + 12, j + 24].map((k) => Math.min(k, last)).find((k) => k > j && straight(i, k));
-      if (next === undefined) break;
-      j = next;
-      if (j === last) break;
+    // Grow by doubling, then binary-search the end: O(log n) straightness
+    // checks instead of one per sample (long edges made this quadratic).
+    {
+      let lo = j;
+      let hi = -1;
+      for (let step = 2; lo < last; step *= 2) {
+        const k = Math.min(lo + step, last);
+        if (straight(i, k)) lo = k;
+        else {
+          hi = k;
+          break;
+        }
+      }
+      if (hi > 0) {
+        while (hi - lo > 1) {
+          const mid = (lo + hi) >> 1;
+          if (straight(i, mid)) lo = mid;
+          else hi = mid;
+        }
+      }
+      j = lo;
     }
     // Settle both ends exactly where the samples leave the line, judged
     // against a line fitted to the stretch's middle (the ends may already
@@ -681,7 +696,8 @@ function fitRunWithLines(
     }
     while ((j < last || !endFixed) && j > start && offLine(q, j) > endTol) j--;
     if (dist(run[start], run[j]) < MIN_LINE || !endsTurn(start, j)) {
-      i++;
+      // Any stretch starting inside this one fails for the same reason.
+      i = Math.max(i + 1, j);
       continue;
     }
     i = start;
