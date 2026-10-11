@@ -25,4 +25,12 @@ export const LOGOS: Record<string, string> = {
     <text x="275" y="105" font-family="Helvetica, Arial" font-size="18" fill="#003049" text-anchor="middle">PRO FINISHES</text>
     <text x="275" y="220" font-family="Georgia, serif" font-size="30" font-style="italic" fill="#d62828" text-anchor="middle">The Wall Experts</text>
   </svg>`,
+  curves: `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 300" width="400" height="300">
+    <rect width="400" height="300" fill="#ffffff"/>
+    <ellipse cx="95" cy="80" rx="75" ry="45" fill="#2a9d8f"/>
+    <path d="M200 40 C 260 0, 330 60, 380 30 L 380 60 C 330 90, 260 30, 200 70 Z" fill="#e76f51"/>
+    <path d="M40 200 C 40 140, 140 150, 150 190 C 160 230, 110 270, 70 260 C 30 250, 40 230, 40 200 Z" fill="#264653"/>
+    <path d="M200 280 C 200 200, 300 260, 300 180 S 380 150, 385 120" fill="none" stroke="#e9c46a" stroke-width="14" stroke-linecap="round"/>
+    <circle cx="300" cy="250" r="22" fill="none" stroke="#264653" stroke-width="5"/>
+  </svg>`,
 };

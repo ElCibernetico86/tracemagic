@@ -352,6 +352,148 @@ function signedArea(pts: Point[]) {
   return area / 2;
 }
 
+/**
+ * Direct least-squares ellipse fit (Fitzgibbon, Pilu & Fisher 1999, in the
+ * numerically stable form of Halíř & Flusser 1998). Returns center, semi-axes
+ * and rotation, or null when the points don't describe an ellipse.
+ */
+function fitEllipse(pts: Point[]) {
+  const n = pts.length;
+  let mx = 0, my = 0;
+  for (const p of pts) { mx += p.x; my += p.y; }
+  mx /= n; my /= n;
+  let scale = 0;
+  for (const p of pts) scale += Math.hypot(p.x - mx, p.y - my);
+  scale = scale / n || 1;
+
+  // Scatter matrices of the quadratic (x², xy, y²) and linear (x, y, 1) parts.
+  const S1 = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
+  const S2 = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
+  const S3 = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
+  for (const p of pts) {
+    const x = (p.x - mx) / scale, y = (p.y - my) / scale;
+    const d1 = [x * x, x * y, y * y];
+    const d2 = [x, y, 1];
+    for (let i = 0; i < 3; i++) {
+      for (let j = 0; j < 3; j++) {
+        S1[i][j] += d1[i] * d1[j];
+        S2[i][j] += d1[i] * d2[j];
+        S3[i][j] += d2[i] * d2[j];
+      }
+    }
+  }
+  const inv3 = (m: number[][]) => {
+    const [a, b, c] = m[0], [d, e, f] = m[1], [g, h, i] = m[2];
+    const A = e * i - f * h, B = -(d * i - f * g), C = d * h - e * g;
+    const det = a * A + b * B + c * C;
+    if (Math.abs(det) < 1e-12) return null;
+    return [
+      [A / det, -(b * i - c * h) / det, (b * f - c * e) / det],
+      [B / det, (a * i - c * g) / det, -(a * f - c * d) / det],
+      [C / det, -(a * h - b * g) / det, (a * e - b * d) / det],
+    ];
+  };
+  const mul = (x: number[][], y: number[][]) => x.map((row) => y[0].map((_, j) => row.reduce((sum, v, k) => sum + v * y[k][j], 0)));
+  const tr = (x: number[][]) => x[0].map((_, j) => x.map((row) => row[j]));
+  const S3inv = inv3(S3);
+  if (!S3inv) return null;
+  const T = mul(S3inv, tr(S2)).map((row) => row.map((v) => -v));
+  const M0 = mul(S2, T).map((row, i) => row.map((v, j) => v + S1[i][j]));
+  // Premultiply by the inverse of the constraint matrix C1 = [[0,0,2],[0,-1,0],[2,0,0]].
+  const M = [M0[2].map((v) => v / 2), M0[1].map((v) => -v), M0[0].map((v) => v / 2)];
+
+  // Real eigenvalues of the 3×3 M via its characteristic cubic.
+  const [[a, b, c], [d, e, f], [g, h, i]] = M;
+  const p2 = -(a + e + i);
+  const p1 = a * e + a * i + e * i - b * d - c * g - f * h;
+  const p0 = -(a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g));
+  const roots: number[] = [];
+  const pp = p1 - (p2 * p2) / 3;
+  const qq = (2 * p2 * p2 * p2) / 27 - (p2 * p1) / 3 + p0;
+  const disc = (qq * qq) / 4 + (pp * pp * pp) / 27;
+  if (disc > 0) {
+    roots.push(Math.cbrt(-qq / 2 + Math.sqrt(disc)) + Math.cbrt(-qq / 2 - Math.sqrt(disc)) - p2 / 3);
+  } else {
+    const r = Math.sqrt(-pp / 3);
+    const phi = Math.acos(Math.max(-1, Math.min(1, -qq / (2 * r * r * r))));
+    for (let k = 0; k < 3; k++) roots.push(2 * r * Math.cos((phi + 2 * Math.PI * k) / 3) - p2 / 3);
+  }
+  const cross = (u: number[], w: number[]) => [u[1] * w[2] - u[2] * w[1], u[2] * w[0] - u[0] * w[2], u[0] * w[1] - u[1] * w[0]];
+  let best: number[] | null = null;
+  for (const lambda of roots) {
+    // Eigenvector: the largest cross product of two rows of (M − λI).
+    const r0 = [a - lambda, b, c], r1 = [d, e - lambda, f], r2 = [g, h, i - lambda];
+    const vec = [cross(r0, r1), cross(r0, r2), cross(r1, r2)].reduce((m, v) => (Math.hypot(...v) > Math.hypot(...m) ? v : m));
+    if (Math.hypot(...vec) < 1e-12) continue;
+    if (4 * vec[0] * vec[2] - vec[1] * vec[1] > 0) best = vec; // the ellipse solution
+  }
+  if (!best) return null;
+  const [A, B, C] = best;
+  const [D, E, F] = T.map((row) => row[0] * A + row[1] * B + row[2] * C);
+
+  // Conic → center, axes, rotation (normalized coordinates, then undone).
+  const den = B * B - 4 * A * C;
+  if (den >= 0) return null;
+  const cx = (2 * C * D - B * E) / den;
+  const cy = (2 * A * E - B * D) / den;
+  const Fc = A * cx * cx + B * cx * cy + C * cy * cy + D * cx + E * cy + F;
+  const theta = 0.5 * Math.atan2(B, A - C);
+  const cos = Math.cos(theta), sin = Math.sin(theta);
+  const Ap = A * cos * cos + B * cos * sin + C * sin * sin;
+  const Cp = A * sin * sin - B * cos * sin + C * cos * cos;
+  if (-Fc / Ap <= 0 || -Fc / Cp <= 0) return null;
+  return {
+    cx: cx * scale + mx,
+    cy: cy * scale + my,
+    rx: Math.sqrt(-Fc / Ap) * scale,
+    ry: Math.sqrt(-Fc / Cp) * scale,
+    angle: theta,
+  };
+}
+
+/** If the closed polyline is an ellipse within tolerance, return a perfect one (4 arcs), preserving winding. */
+function tryEllipseSnap(pts: Point[]): string | null {
+  if (pts.length < 20) return null;
+  const e = fitEllipse(pts);
+  if (!e) return null;
+  const minor = Math.min(e.rx, e.ry);
+  const major = Math.max(e.rx, e.ry);
+  if (minor < 3 || major / minor > 8) return null;
+  const cos = Math.cos(e.angle), sin = Math.sin(e.angle);
+  // Radial distance from each point to the ellipse, in px.
+  let sumSq = 0, maxRes = 0;
+  const angles: number[] = [];
+  for (const p of pts) {
+    const dx = p.x - e.cx, dy = p.y - e.cy;
+    const u = dx * cos + dy * sin, v = -dx * sin + dy * cos;
+    const t = Math.atan2(v, u);
+    const rho = 1 / Math.sqrt((Math.cos(t) / e.rx) ** 2 + (Math.sin(t) / e.ry) ** 2);
+    const res = Math.abs(Math.hypot(u, v) - rho);
+    sumSq += res * res;
+    maxRes = Math.max(maxRes, res);
+    angles.push(t);
+  }
+  const rms = Math.sqrt(sumSq / pts.length);
+  // Same size-relative tolerance as circles: small ovals (letters) don't snap.
+  if (rms > Math.max(0.2, minor * 0.012) || maxRes > Math.max(0.6, minor * 0.035)) return null;
+  angles.sort((x, y) => x - y);
+  let maxGap = angles[0] + 2 * Math.PI - angles[angles.length - 1];
+  for (let k = 1; k < angles.length; k++) maxGap = Math.max(maxGap, angles[k] - angles[k - 1]);
+  if (maxGap > Math.PI / 3) return null;
+
+  const sweep = signedArea(pts) > 0 ? 1 : 0;
+  const at = (t: number) => ({
+    x: e.cx + e.rx * Math.cos(t) * cos - e.ry * Math.sin(t) * sin,
+    y: e.cy + e.rx * Math.cos(t) * sin + e.ry * Math.sin(t) * cos,
+  });
+  const dir = sweep ? 1 : -1;
+  const q = [0, 1, 2, 3, 4].map((k) => at((dir * k * Math.PI) / 2));
+  const rot = round((e.angle * 180) / Math.PI);
+  let d = `M${round(q[0].x)} ${round(q[0].y)}`;
+  for (let k = 1; k <= 4; k++) d += `A${round(e.rx)} ${round(e.ry)} ${rot} 0 ${sweep} ${round(q[k].x)} ${round(q[k].y)}`;
+  return d + 'Z';
+}
+
 /** If the polyline is a circle within tolerance, return a perfect-circle path preserving winding. */
 function tryCircleSnap(pts: Point[]): string | null {
   if (pts.length < 12) return null;
@@ -457,10 +599,18 @@ function fitRunWithLines(
   startTan?: Point | null,
   endTan?: Point | null,
 ): string | null {
-  const MIN_LINE = 6; // px
+  // Straight stretches inside a curved run must be long: the flattest part
+  // of a big curve passes a short straightness test and would turn the curve
+  // into a polygon. (A whole corner-to-corner run is handled below.)
+  const MIN_LINE = 15; // px
   const run = input.slice();
   const last = run.length - 1;
   const straight = (i0: number, i1: number) => isLineLike(run, i0, i1, noise);
+
+  // Corner to corner and straight (a star's edge, a letter stem): one line.
+  if (!startTan && !endTan && last >= 1 && isLineLike(run, 0, last, noise, true)) {
+    return `L${round(run[last].x)} ${round(run[last].y)}`;
+  }
   // Where a line meets a curve, the line must stop where the edge starts to
   // bend, or the curve begins with a kink.
   const endTol = 0.12 + noise;
@@ -474,6 +624,26 @@ function fitRunWithLines(
       cnt++;
     }
     return Math.abs(sum / cnt);
+  };
+
+  // A real straight edge ends where the outline turns into a corner or a
+  // clearly curved arc (a rounded rectangle's side). The flat middle of a
+  // gentle curve keeps curving at the same slow rate past both ends — making
+  // it a line would leave visible flat spots.
+  const endsTurn = (i0: number, i1: number) => {
+    const dir = unit(run[i1].x - run[i0].x, run[i1].y - run[i0].y);
+    if (!dir) return false;
+    const turnPast = (from: number, step: 1 | -1) => {
+      let k = from;
+      while (k + step >= 0 && k + step <= last && dist(run[from], run[k]) < 8) k += step;
+      if (k === from) return 180; // run end: a corner
+      const v = unit((run[k].x - run[from].x) * step, (run[k].y - run[from].y) * step);
+      if (!v) return 180;
+      return (Math.acos(Math.max(-1, Math.min(1, v.x * dir.x + v.y * dir.y))) * 180) / Math.PI;
+    };
+    const atStart = i0 === 0 ? (startTan ? turnPast(i0, -1) : 180) : turnPast(i0, -1);
+    const atEnd = i1 === last ? (endTan ? turnPast(i1, 1) : 180) : turnPast(i1, 1);
+    return atStart >= 10 && atEnd >= 10;
   };
 
   let d = '';
@@ -510,7 +680,7 @@ function fitRunWithLines(
       while (start < j && offLine(q, start) > endTol) start++;
     }
     while ((j < last || !endFixed) && j > start && offLine(q, j) > endTol) j--;
-    if (dist(run[start], run[j]) < MIN_LINE) {
+    if (dist(run[start], run[j]) < MIN_LINE || !endsTurn(start, j)) {
       i++;
       continue;
     }
@@ -552,14 +722,23 @@ function fitRunWithLines(
  * the stretch length — so long stretches can tolerate more bow before they
  * stop looking straight, and short ones must be tight.
  */
-function isLineLike(run: Point[], i0: number, i1: number, noise: number) {
+function isLineLike(run: Point[], i0: number, i1: number, noise: number, cornerToCorner = false) {
   const len = dist(run[i0], run[i1]);
   const q = lineQuality(run, i0, i1);
-  const sagTol = Math.max(1.2 * noise, Math.min(0.4, 0.12 + (len - 12) * 0.0125));
-  const rmsTol = Math.max(1.6 * noise, 0.4);
+  // An arc's bow grows with the square of its length, edge wobble doesn't:
+  // the allowance grows slowly with length so arcs fail at every length.
+  const sagTol = cornerToCorner
+    ? Math.max(1.2 * noise, Math.min(0.4, 0.1 + len * 0.005))
+    : Math.max(1.2 * noise, Math.min(0.4, 0.06 + Math.max(0, len - 15) * 0.01));
+  // Inside a curved run the tolerance is tight: near an S-bend's inflection a
+  // curve is almost straight for a while, and a loose test turns it into a
+  // line with a kink at each end. Corner-to-corner edges get more slack for
+  // compression wobble.
+  const rmsTol = cornerToCorner ? Math.max(1.6 * noise, 0.4) : Math.max(1.6 * noise, 0.2);
+  const maxTol = cornerToCorner ? Math.max(0.75, 3 * noise) : Math.max(0.4, 3 * noise);
   // The max-residual guard stops a long line from averaging away the start
   // of an adjoining curve.
-  return q.rms <= rmsTol && q.sag <= sagTol && q.maxE <= Math.max(0.75, 3 * noise);
+  return q.rms <= rmsTol && q.sag <= sagTol && q.maxE <= maxTol;
 }
 
 function unit(x: number, y: number): Point | null {
@@ -583,7 +762,7 @@ function fitRun(run: Point[], maxError: number, noise = 0, leftTan?: Point | nul
   if (run.length < 2) return '';
   const last = run[run.length - 1];
   if (run.length <= 3) return `L${round(last.x)} ${round(last.y)}`;
-  if (isLineLike(run, 0, run.length - 1, noise)) {
+  if (!leftTan && !rightTan && isLineLike(run, 0, run.length - 1, noise, true)) {
     return `L${round(last.x)} ${round(last.y)}`;
   }
   const lt = leftTan ?? tangentFrom(run, 0, 1);
@@ -604,6 +783,57 @@ function fitRun(run: Point[], maxError: number, noise = 0, leftTan?: Point | nul
     d += `C${nums.map(round).join(' ')}`;
   }
   return d;
+}
+
+/**
+ * Gaussian smoothing along a sampled polyline with "twicing" (2G − G∘G),
+ * which cancels most of the shrinkage plain smoothing causes on curves.
+ * Open runs keep their end points (anti-symmetric extension at the ends).
+ */
+function smoothAlong(pts: Point[], sigmaSamples: number, closed: boolean): Point[] {
+  const n = closed ? pts.length - 1 : pts.length; // closed input repeats its first point
+  if (n < 5) return pts;
+  const R = Math.min(Math.ceil(3 * sigmaSamples), n - 1);
+  const w: number[] = [];
+  let wsum = 0;
+  for (let k = -R; k <= R; k++) {
+    const v = Math.exp(-(k * k) / (2 * sigmaSamples * sigmaSamples));
+    w.push(v);
+    wsum += v;
+  }
+  const blur = (src: Point[]): Point[] => {
+    const get = (i: number): Point => {
+      if (closed) return src[((i % n) + n) % n];
+      if (i < 0) return { x: 2 * src[0].x - src[-i].x, y: 2 * src[0].y - src[-i].y };
+      if (i > n - 1) {
+        const m = 2 * (n - 1) - i;
+        return { x: 2 * src[n - 1].x - src[m].x, y: 2 * src[n - 1].y - src[m].y };
+      }
+      return src[i];
+    };
+    const out: Point[] = [];
+    for (let i = 0; i < n; i++) {
+      let x = 0, y = 0;
+      for (let k = -R; k <= R; k++) {
+        const p = get(i + k);
+        x += w[k + R] * p.x;
+        y += w[k + R] * p.y;
+      }
+      out.push({ x: x / wsum, y: y / wsum });
+    }
+    return out;
+  };
+  const base = pts.slice(0, n);
+  const g1 = blur(base);
+  const g2 = blur(g1);
+  const out = base.map((p, i) => ({ x: 2 * g1[i].x - g2[i].x, y: 2 * g1[i].y - g2[i].y }));
+  if (!closed) {
+    out[0] = pts[0];
+    out[n - 1] = pts[n - 1];
+  } else {
+    out.push(out[0]);
+  }
+  return out;
 }
 
 /** Re-sample a polyline at uniform arc-length spacing. */
@@ -718,7 +948,7 @@ function detectCorners(pts: Point[], closed: boolean, cornerDeg: number, step: n
   return { corners, big, kSmall, kBig };
 }
 
-function rebuildSubpath(sub: Subpath, maxError: number, cornerDeg: number): string | null {
+function rebuildSubpath(sub: Subpath, maxError: number, cornerDeg: number, outlineSigma: number): string | null {
   const STEP = 0.5;
   let pts = sub.points;
 
@@ -732,6 +962,8 @@ function rebuildSubpath(sub: Subpath, maxError: number, cornerDeg: number): stri
   if (sub.closed) {
     const circle = tryCircleSnap(pts);
     if (circle) return circle;
+    const ellipse = tryEllipseSnap(pts);
+    if (ellipse) return ellipse;
   }
 
   const sampled = resample(pts, sub.closed, STEP);
@@ -756,14 +988,6 @@ function rebuildSubpath(sub: Subpath, maxError: number, cornerDeg: number): stri
 
   const detected = detectCorners(pts, sub.closed, cornerDeg, STEP);
   let cornerIdx = detected.corners;
-  const DBG = process.env.GDBG && pts.every((p) => p.x > 210 && p.x < 224 && p.y > 88 && p.y < 108);
-  if (DBG) {
-    console.error('P subpath n=', n, 'closed', sub.closed);
-    // bottom-most samples and their turns
-    const order = pts.map((p, i) => i).sort((a, b) => pts[b].y - pts[a].y).slice(0, 12);
-    for (const i of order) console.error(`  i=${i} (${pts[i].x.toFixed(2)},${pts[i].y.toFixed(2)}) big=${detected.big[i].toFixed(0)} small=${turnK(pts, i, detected.kSmall, sub.closed).toFixed(0)}`);
-    console.error('  corners', cornerIdx.map((c) => `${c}:${detected.big[c].toFixed(0)}`).join(' '));
-  }
 
   if (sub.closed && cornerIdx.length > 0) {
     // Start the loop at a corner so no corner zone straddles the seam.
@@ -846,6 +1070,23 @@ function rebuildSubpath(sub: Subpath, maxError: number, cornerDeg: number): stri
     if (corners[corners.length - 1] !== pts.length - 1) corners.push(pts.length - 1);
   }
 
+  // Along-the-outline smoothing of each corner-to-corner run (corners stay
+  // fixed). Removes the ~10px waves JPEG blocks leave in edges, which the
+  // small-scale smoothing above can't touch. Strength follows the Smoothing
+  // setting; runs are never smoothed over more than an eighth of their length.
+  if (outlineSigma > 0.3) {
+    const runs = corners.slice(0, -1).map((c, k) => [c, corners[k + 1]] as const);
+    const out = pts.slice();
+    for (const [a, b] of runs) {
+      const runLen = (b - a) * STEP;
+      const sig = Math.min(outlineSigma, runLen / 8) / STEP;
+      if (sig < 1) continue;
+      const sm = smoothAlong(pts.slice(a, b + 1), sig, smoothSeam && runs.length === 1);
+      for (let k = 1; k < sm.length - 1; k++) out[a + k] = sm[k];
+    }
+    pts = out;
+  }
+
   // A closed loop with no corners is cut at an arbitrary point: give both
   // sides of the cut the same tangent so the seam is invisible.
   let seamTan: Point | null = null;
@@ -920,6 +1161,8 @@ export function refineTracedSvg(svg: string, options: RefineOptions): string {
   const smoothness = Math.min(100, Math.max(0, options.smoothness));
   const maxError = 0.25 + (smoothness / 100) * 0.6;
   const cornerDeg = 28 + smoothness * 0.3;
+  // Along-outline smoothing radius (px): 4 at the default setting of 50.
+  const outlineSigma = smoothness * 0.08;
   const scale = options.scale ?? 1;
   const curves = options.curves ?? true;
 
@@ -946,7 +1189,7 @@ export function refineTracedSvg(svg: string, options: RefineOptions): string {
           out += polylineD(sub);
           continue;
         }
-        const rebuilt = rebuildSubpath(sub, maxError, cornerDeg);
+        const rebuilt = rebuildSubpath(sub, maxError, cornerDeg, outlineSigma);
         out += rebuilt ?? polylineD(sub);
       }
       return tag
