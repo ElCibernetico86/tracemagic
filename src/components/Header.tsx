@@ -31,7 +31,7 @@ export default function Header() {
           </Link>
 
           {/* Desktop Nav */}
-          <nav className="hidden md:flex items-center gap-8 text-[11px] font-bold text-white/60 uppercase tracking-[1.5px]">
+          <nav className="hidden lg:flex items-center gap-8 text-[11px] font-bold text-white/60 uppercase tracking-[1.5px]">
             <Link to="/app" className="hover:text-white transition-colors">Trace</Link>
             <Link to="/upscale" className="hover:text-white transition-colors">Upscale</Link>
             <Link to="/features" className="hover:text-white transition-colors">Features</Link>
@@ -40,7 +40,7 @@ export default function Header() {
             <Link to="/vs/vectorizer-ai" className="hover:text-white transition-colors">Compare</Link>
           </nav>
 
-          <div className="hidden md:flex items-center gap-4">
+          <div className="hidden lg:flex items-center gap-4">
             {user && (
               <Link to="/dashboard" className="text-[11px] font-bold text-white/60 hover:text-white uppercase tracking-[1.5px] flex items-center gap-2">
                 <img src={user.photoURL || ''} alt="avatar" className="w-6 h-6 rounded-full" />
@@ -63,7 +63,7 @@ export default function Header() {
 
           {/* Mobile Menu Button */}
           <button 
-            className="md:hidden p-2 text-white/60"
+            className="lg:hidden p-2 text-white/60"
             onClick={() => setIsOpen(!isOpen)}
           >
             {isOpen ? <X className="w-6 h-6" /> : <Menu className="w-6 h-6" />}
@@ -73,7 +73,7 @@ export default function Header() {
 
       {/* Mobile Nav */}
       {isOpen && (
-        <div className="md:hidden border-t border-white/10 bg-[#050505]">
+        <div className="lg:hidden border-t border-white/10 bg-[#050505]">
           <div className="px-4 py-6 flex flex-col gap-4 text-[11px] font-bold uppercase tracking-[1.5px]">
             <Link to="/app" onClick={() => setIsOpen(false)} className="text-white/60 hover:text-white">Trace</Link>
             <Link to="/upscale" onClick={() => setIsOpen(false)} className="text-white/60 hover:text-white">Upscale</Link>
