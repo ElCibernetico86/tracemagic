@@ -22,6 +22,7 @@ const EDGE_SMOOTHING = 0.6;
 type TraceMode = 'color' | 'grayscale' | 'bw';
 type CurveMode = 'spline' | 'polygon' | 'pixel';
 type ShapeStacking = 'stacked' | 'cutout';
+type DrawStyle = 'fill' | 'stroke';
 
 export const SUPPORTED_IMAGE_TYPES = new Set(['image/png', 'image/jpeg', 'image/webp', 'image/gif']);
 
@@ -38,6 +39,14 @@ export interface TraceOptions {
   groupByColor: boolean;
   /** Snap straight edges within 2° of level/plumb exactly onto it. */
   snapAxes: boolean;
+  /** Allow circular/elliptical SVG arc primitives (default true). */
+  allowArcs: boolean;
+  /** Eliminate anti-aliasing hairline seams between adjacent shapes (Vectorizer.AI Gap Filler). */
+  gapFiller: boolean;
+  /** Fill solid shapes or draw stroked outlines (for CAD / laser / engraving). */
+  drawStyle: DrawStyle;
+  /** Stroke width in px when drawStyle === 'stroke' (or gap filler width). */
+  strokeWidth: number;
   /** Fixed palette chosen by the user (color reduction); null = detect. */
   palette: RGB[] | null;
 }
@@ -85,7 +94,27 @@ export function parseTraceOptions(body: Record<string, unknown>): TraceOptions {
   const stacking: ShapeStacking = body.stacking === 'cutout' ? 'cutout' : 'stacked';
 
   const snapAxes = !(body.snapAxes === 'false' || body.snapAxes === false);
-  return { mode, maxColors, detail, smoothness, curveMode, stacking, groupByColor, snapAxes, palette: parsePalette(body.palette) };
+  const allowArcs = !(body.allowArcs === 'false' || body.allowArcs === false);
+  const gapFiller = body.gapFiller === 'true' || body.gapFiller === true;
+  const drawStyle: DrawStyle = body.drawStyle === 'stroke' ? 'stroke' : 'fill';
+  const rawStroke = Number(body.strokeWidth);
+  const strokeWidth = Number.isFinite(rawStroke) ? clamp(rawStroke, 0.25, 20) : 1.5;
+
+  return {
+    mode,
+    maxColors,
+    detail,
+    smoothness,
+    curveMode,
+    stacking,
+    groupByColor,
+    snapAxes,
+    allowArcs,
+    gapFiller,
+    drawStyle,
+    strokeWidth,
+    palette: parsePalette(body.palette),
+  };
 }
 
 function buildVectorizerConfig(options: TraceOptions, scale: number) {
@@ -242,7 +271,7 @@ async function preprocessImage(buffer: Buffer, options: TraceOptions) {
 function svgStats(svg: string) {
   const paths = (svg.match(/<path[\s>]/g) || []).length;
   const fills = new Set<string>();
-  for (const match of svg.matchAll(/fill="([^"]+)"/g)) {
+  for (const match of svg.matchAll(/(?:fill|stroke)="([^"]+)"/g)) {
     if (match[1] !== 'none') fills.add(match[1].toLowerCase());
   }
   return { paths, colors: fills.size, bytes: Buffer.byteLength(svg, 'utf8') };
@@ -418,6 +447,7 @@ export async function traceImage(
       curves: options.curveMode === 'spline',
       staircase: options.curveMode === 'spline',
       snapAxes: options.snapAxes,
+      allowArcs: options.allowArcs,
     });
     debug?.('refined', svg, toHex(color));
 
@@ -426,11 +456,21 @@ export async function traceImage(
     if (paths.length > 0) layers.push({ hex: toHex(color), paths });
   }
 
+  const styleAttrs = (hex: string) => {
+    if (options.drawStyle === 'stroke') {
+      return `fill="none" stroke="#${hex}" stroke-width="${options.strokeWidth}" stroke-linejoin="round" stroke-linecap="round"`;
+    }
+    if (options.gapFiller) {
+      return `fill="#${hex}" stroke="#${hex}" stroke-width="0.6" stroke-linejoin="round"`;
+    }
+    return `fill="#${hex}"`;
+  };
+
   const body = layers
     .map(({ hex, paths }) =>
       options.groupByColor
-        ? `<g id="color-${hex}" fill="#${hex}">${paths.join('')}</g>`
-        : paths.map((path) => path.replace('<path', `<path fill="#${hex}"`)).join(''),
+        ? `<g id="color-${hex}" ${styleAttrs(hex)}>${paths.join('')}</g>`
+        : paths.map((path) => path.replace('<path', `<path ${styleAttrs(hex)}`)).join(''),
     )
     .join('');
   const svg =

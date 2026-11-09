@@ -310,15 +310,41 @@ function parseHex(color: string): [number, number, number] {
   return Number.isFinite(n) ? [(n >> 16) & 255, (n >> 8) & 255, n & 255] : [0, 0, 0];
 }
 
-/** Fill of an element, inherited from ancestor <g fill> when not set on the path. */
-function resolveFill(el: Element): string {
+/** Fill or stroke of an element, inherited from ancestor <g> when not set on the path. */
+function resolveColorAndStyle(el: Element): { color: string; isStroke: boolean; strokeWidth: number } {
+  let color = '#000000';
+  let fillAttr: string | null = null;
+  let strokeAttr: string | null = null;
+  let strokeWidth = 1;
+
   for (let node: Element | null = el; node; node = node.parentElement) {
-    const fill = node.getAttribute('fill');
-    if (fill) return fill;
-    const style = node.getAttribute('style')?.match(/fill:\s*([^;]+)/);
-    if (style) return style[1].trim();
+    if (fillAttr === null) {
+      const f = node.getAttribute('fill') ?? node.getAttribute('style')?.match(/fill:\s*([^;]+)/)?.[1]?.trim();
+      if (f) fillAttr = f;
+    }
+    if (strokeAttr === null) {
+      const s = node.getAttribute('stroke') ?? node.getAttribute('style')?.match(/stroke:\s*([^;]+)/)?.[1]?.trim();
+      if (s) strokeAttr = s;
+    }
+    const sw = node.getAttribute('stroke-width');
+    if (sw && Number.isFinite( parseFloat(sw))) strokeWidth = parseFloat(sw);
   }
-  return '#000000';
+
+  const isStroke = fillAttr === 'none' && !!strokeAttr && strokeAttr !== 'none';
+  if (isStroke && strokeAttr) {
+    color = strokeAttr;
+  } else if (fillAttr && fillAttr !== 'none') {
+    color = fillAttr;
+  } else if (strokeAttr && strokeAttr !== 'none') {
+    color = strokeAttr;
+  }
+  return { color, isStroke, strokeWidth };
+}
+
+function resolveFill(el: Element): string {
+  const { color, isStroke } = resolveColorAndStyle(el);
+  if (!isStroke && el.getAttribute('fill') === 'none' && !el.closest('[stroke]')) return 'none';
+  return color;
 }
 
 export interface DxfResult {
@@ -398,4 +424,331 @@ export function svgToDxf(svg: string, tolerance = 0.25): DxfResult {
   g(0, 'EOF');
 
   return { dxf: lines.join('\n') + '\n', layers: layerColors.size, polylines: entities.length };
+}
+
+// ---------- Vector EPS & PDF Exporters ----------
+
+interface CubicCmd {
+  type: 'M' | 'L' | 'C' | 'Z';
+  args: number[];
+}
+
+/**
+ * Convert an SVG path `d` attribute into pure M / L / C / Z commands with
+ * Y flipped (`height - y`) for PostScript and PDF coordinate systems.
+ * Circular/elliptical arcs (`A`) and quadratics (`Q`/`T`) are converted cleanly.
+ */
+function pathToPostScriptCmds(d: string, height: number): CubicCmd[] {
+  const tokens = d.match(/[MLHVCSQTAZmlhvcsqtaz]|[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?/g) ?? [];
+  const cmds: CubicCmd[] = [];
+  let cur: Pt = [0, 0];
+  let start: Pt = [0, 0];
+  let prevCubic: Pt | null = null;
+  let prevQuad: Pt | null = null;
+  let cmd = '';
+  let i = 0;
+
+  const r = (n: number) => Math.round(n * 100) / 100;
+  const fy = (y: number) => r(height - y);
+  const fx = (x: number) => r(x);
+
+  while (i < tokens.length) {
+    if (/[a-zA-Z]/.test(tokens[i])) {
+      cmd = tokens[i++];
+      if (cmd === 'Z' || cmd === 'z') {
+        cur = start;
+        cmds.push({ type: 'Z', args: [] });
+        prevCubic = prevQuad = null;
+        continue;
+      }
+    } else if (cmd === 'M') {
+      cmd = 'L';
+    } else if (cmd === 'm') {
+      cmd = 'l';
+    }
+    const upper = cmd.toUpperCase();
+    const need = ARG_COUNTS[upper];
+    if (need === undefined || i + need > tokens.length) break;
+    const a = tokens.slice(i, i + need).map(Number);
+    i += need;
+    const rel = cmd !== upper;
+    const abs = (x: number, y: number): Pt => (rel ? [cur[0] + x, cur[1] + y] : [x, y]);
+
+    switch (upper) {
+      case 'M':
+        cur = abs(a[0], a[1]);
+        start = cur;
+        cmds.push({ type: 'M', args: [fx(cur[0]), fy(cur[1])] });
+        prevCubic = prevQuad = null;
+        break;
+      case 'L':
+        cur = abs(a[0], a[1]);
+        cmds.push({ type: 'L', args: [fx(cur[0]), fy(cur[1])] });
+        prevCubic = prevQuad = null;
+        break;
+      case 'H':
+        cur = [rel ? cur[0] + a[0] : a[0], cur[1]];
+        cmds.push({ type: 'L', args: [fx(cur[0]), fy(cur[1])] });
+        prevCubic = prevQuad = null;
+        break;
+      case 'V':
+        cur = [cur[0], rel ? cur[1] + a[0] : a[0]];
+        cmds.push({ type: 'L', args: [fx(cur[0]), fy(cur[1])] });
+        prevCubic = prevQuad = null;
+        break;
+      case 'C': {
+        const c1 = abs(a[0], a[1]);
+        const c2 = abs(a[2], a[3]);
+        const p = abs(a[4], a[5]);
+        cmds.push({ type: 'C', args: [fx(c1[0]), fy(c1[1]), fx(c2[0]), fy(c2[1]), fx(p[0]), fy(p[1])] });
+        prevCubic = c2;
+        prevQuad = null;
+        cur = p;
+        break;
+      }
+      case 'S': {
+        const c1: Pt = prevCubic ? [2 * cur[0] - prevCubic[0], 2 * cur[1] - prevCubic[1]] : cur;
+        const c2 = abs(a[0], a[1]);
+        const p = abs(a[2], a[3]);
+        cmds.push({ type: 'C', args: [fx(c1[0]), fy(c1[1]), fx(c2[0]), fy(c2[1]), fx(p[0]), fy(p[1])] });
+        prevCubic = c2;
+        prevQuad = null;
+        cur = p;
+        break;
+      }
+      case 'Q': {
+        const c = abs(a[0], a[1]);
+        const p = abs(a[2], a[3]);
+        const c1: Pt = [cur[0] + (2 / 3) * (c[0] - cur[0]), cur[1] + (2 / 3) * (c[1] - cur[1])];
+        const c2: Pt = [p[0] + (2 / 3) * (c[0] - p[0]), p[1] + (2 / 3) * (c[1] - p[1])];
+        cmds.push({ type: 'C', args: [fx(c1[0]), fy(c1[1]), fx(c2[0]), fy(c2[1]), fx(p[0]), fy(p[1])] });
+        prevQuad = c;
+        prevCubic = null;
+        cur = p;
+        break;
+      }
+      case 'T': {
+        const c: Pt = prevQuad ? [2 * cur[0] - prevQuad[0], 2 * cur[1] - prevQuad[1]] : cur;
+        const p = abs(a[0], a[1]);
+        const c1: Pt = [cur[0] + (2 / 3) * (c[0] - cur[0]), cur[1] + (2 / 3) * (c[1] - cur[1])];
+        const c2: Pt = [p[0] + (2 / 3) * (c[0] - p[0]), p[1] + (2 / 3) * (c[1] - p[1])];
+        cmds.push({ type: 'C', args: [fx(c1[0]), fy(c1[1]), fx(c2[0]), fy(c2[1]), fx(p[0]), fy(p[1])] });
+        prevQuad = c;
+        prevCubic = null;
+        cur = p;
+        break;
+      }
+      case 'A': {
+        const p = abs(a[5], a[6]);
+        const pts: Pt[] = [];
+        arcPoints(cur, a[0], a[1], a[2], a[3], a[4], p, 0.75, pts);
+        for (const pt of pts) {
+          cmds.push({ type: 'L', args: [fx(pt[0]), fy(pt[1])] });
+        }
+        prevCubic = prevQuad = null;
+        cur = p;
+        break;
+      }
+    }
+  }
+  return cmds;
+}
+
+/**
+ * Convert a traced SVG into an Encapsulated PostScript (EPS) vector file,
+ * compatible with Adobe Illustrator, Affinity Designer, CorelDRAW, and print RIPs.
+ */
+export function svgToEps(svg: string): string {
+  const doc = new DOMParser().parseFromString(svg, 'image/svg+xml');
+  const { width, height } = svgSize(svg);
+  const w = Math.ceil(width);
+  const h = Math.ceil(height);
+
+  const out: string[] = [
+    '%!PS-Adobe-3.0 EPSF-3.0',
+    `%%BoundingBox: 0 0 ${w} ${h}`,
+    `%%HiResBoundingBox: 0.0 0.0 ${width.toFixed(2)} ${height.toFixed(2)}`,
+    '%%Creator: TraceMagic Vector Engine',
+    '%%LanguageLevel: 2',
+    '%%Pages: 1',
+    '%%EndComments',
+    '%%BeginProlog',
+    '/M { moveto } bind def',
+    '/L { lineto } bind def',
+    '/C { curveto } bind def',
+    '/Z { closepath } bind def',
+    '/RGB { setrgbcolor } bind def',
+    '%%EndProlog',
+    '%%Page: 1 1',
+    'gsave',
+    '1 setlinejoin 1 setlinecap',
+  ];
+
+  for (const path of Array.from(doc.querySelectorAll('path'))) {
+    const d = path.getAttribute('d');
+    if (!d) continue;
+    const { color, isStroke, strokeWidth } = resolveColorAndStyle(path);
+    if (color === 'none') continue;
+    const [r, g, b] = parseHex(color.startsWith('#') ? color : '#000000').map(
+      (v) => Math.round((v / 255) * 1000) / 1000,
+    );
+    const cmds = pathToPostScriptCmds(d, height);
+    if (cmds.length === 0) continue;
+
+    out.push(`${r} ${g} ${b} RGB`);
+    out.push('newpath');
+    for (const c of cmds) {
+      out.push(c.args.length ? `${c.args.join(' ')} ${c.type}` : c.type);
+    }
+    if (isStroke) {
+      out.push(`${strokeWidth} setlinewidth stroke`);
+    } else {
+      out.push('eofill');
+    }
+  }
+
+  out.push('grestore', 'showpage', '%%EOF');
+  return out.join('\n') + '\n';
+}
+
+/**
+ * Convert a traced SVG into a standalone, lossless Vector PDF 1.4 document.
+ */
+export function svgToPdf(svg: string): Blob {
+  const doc = new DOMParser().parseFromString(svg, 'image/svg+xml');
+  const { width, height } = svgSize(svg);
+  const w = Math.round(width * 100) / 100;
+  const h = Math.round(height * 100) / 100;
+
+  const streamLines: string[] = ['1 j 1 J'];
+
+  for (const path of Array.from(doc.querySelectorAll('path'))) {
+    const d = path.getAttribute('d');
+    if (!d) continue;
+    const { color, isStroke, strokeWidth } = resolveColorAndStyle(path);
+    if (color === 'none') continue;
+    const [r, g, b] = parseHex(color.startsWith('#') ? color : '#000000').map(
+      (v) => Math.round((v / 255) * 1000) / 1000,
+    );
+    const cmds = pathToPostScriptCmds(d, height);
+    if (cmds.length === 0) continue;
+
+    if (isStroke) {
+      streamLines.push(`${r} ${g} ${b} RG ${strokeWidth} w`);
+    } else {
+      streamLines.push(`${r} ${g} ${b} rg`);
+    }
+
+    for (const c of cmds) {
+      if (c.type === 'M') streamLines.push(`${c.args.join(' ')} m`);
+      else if (c.type === 'L') streamLines.push(`${c.args.join(' ')} l`);
+      else if (c.type === 'C') streamLines.push(`${c.args.join(' ')} c`);
+      else if (c.type === 'Z') streamLines.push('h');
+    }
+    streamLines.push(isStroke ? 'S' : 'f*');
+  }
+
+  const streamContent = streamLines.join('\n');
+  const encoder = new TextEncoder();
+  const streamBytes = encoder.encode(streamContent).byteLength;
+
+  const objects = [
+    '1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj',
+    '2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj',
+    `3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 ${w} ${h}] /Contents 4 0 R >>\nendobj`,
+    `4 0 obj\n<< /Length ${streamBytes} >>\nstream\n${streamContent}\nendstream\nendobj`,
+  ];
+
+  let pdf = '%PDF-1.4\n';
+  const offsets: number[] = [];
+  for (const obj of objects) {
+    offsets.push(encoder.encode(pdf).byteLength);
+    pdf += obj + '\n';
+  }
+  const xrefOffset = encoder.encode(pdf).byteLength;
+  pdf += `xref\n0 ${objects.length + 1}\n0000000000 65535 f \n`;
+  for (const off of offsets) {
+    pdf += `${String(off).padStart(10, '0')} 00000 n \n`;
+  }
+  pdf += `trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${xrefOffset}\n%%EOF\n`;
+
+  return new Blob([pdf], { type: 'application/pdf' });
+}
+
+/**
+ * Extract anchor points (M, L, C, A endpoints) from an SVG string so the
+ * Vector Inspector can overlay control nodes just like Vectorizer.AI.
+ */
+export function extractSvgNodes(svg: string): Pt[] {
+  const doc = new DOMParser().parseFromString(svg, 'image/svg+xml');
+  const nodes: Pt[] = [];
+  const MAX_NODES = 2500;
+
+  for (const path of Array.from(doc.querySelectorAll('path'))) {
+    const d = path.getAttribute('d');
+    if (!d) continue;
+    const tokens = d.match(/[MLHVCSQTAZmlhvcsqtaz]|[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?/g) ?? [];
+    let cur: Pt = [0, 0];
+    let start: Pt = [0, 0];
+    let cmd = '';
+    let i = 0;
+
+    while (i < tokens.length && nodes.length < MAX_NODES) {
+      if (/[a-zA-Z]/.test(tokens[i])) {
+        cmd = tokens[i++];
+        if (cmd === 'Z' || cmd === 'z') {
+          cur = start;
+          continue;
+        }
+      } else if (cmd === 'M') cmd = 'L';
+      else if (cmd === 'm') cmd = 'l';
+
+      const upper = cmd.toUpperCase();
+      const need = ARG_COUNTS[upper];
+      if (need === undefined || i + need > tokens.length) break;
+      const a = tokens.slice(i, i + need).map(Number);
+      i += need;
+      const rel = cmd !== upper;
+      const abs = (x: number, y: number): Pt => (rel ? [cur[0] + x, cur[1] + y] : [x, y]);
+
+      switch (upper) {
+        case 'M':
+          cur = abs(a[0], a[1]);
+          start = cur;
+          nodes.push(cur);
+          break;
+        case 'L':
+          cur = abs(a[0], a[1]);
+          nodes.push(cur);
+          break;
+        case 'H':
+          cur = [rel ? cur[0] + a[0] : a[0], cur[1]];
+          nodes.push(cur);
+          break;
+        case 'V':
+          cur = [cur[0], rel ? cur[1] + a[0] : a[0]];
+          nodes.push(cur);
+          break;
+        case 'C':
+          cur = abs(a[4], a[5]);
+          nodes.push(cur);
+          break;
+        case 'S':
+        case 'Q':
+          cur = abs(a[2], a[3]);
+          nodes.push(cur);
+          break;
+        case 'T':
+          cur = abs(a[0], a[1]);
+          nodes.push(cur);
+          break;
+        case 'A':
+          cur = abs(a[5], a[6]);
+          nodes.push(cur);
+          break;
+      }
+    }
+    if (nodes.length >= MAX_NODES) break;
+  }
+  return nodes;
 }

@@ -79,17 +79,45 @@ export function mapToNearest(colors: string[], kept: string[]): Map<string, stri
   return map;
 }
 
-/** Recolor a traced SVG (grouped or not) for an instant preview of a reduced palette. */
-export function recolorSvg(svg: string, mapping: Map<string, string>): string {
+/**
+ * Recolor a traced SVG (grouped or not) and optionally hide/knock out
+ * transparent colors for an instant client-side preview or export.
+ */
+export function recolorSvg(
+  svg: string,
+  mapping: Map<string, string>,
+  overrides?: Record<string, string>,
+  transparentColors?: Set<string>,
+): string {
+  const resolveHex = (origHex: string): string | null => {
+    const key = `#${origHex.toUpperCase()}`;
+    const mapped = (mapping.get(key) ?? key).toUpperCase();
+    if (transparentColors?.has(mapped) || transparentColors?.has(key)) return null;
+    const custom = overrides?.[mapped] ?? overrides?.[key];
+    return (custom ?? mapped).toUpperCase();
+  };
+
+  let out = svg;
+  if (transparentColors && transparentColors.size > 0) {
+    // Remove grouped layers whose color was marked transparent
+    out = out.replace(/<g id="color-([0-9a-fA-F]{6})"[^>]*>[\s\S]*?<\/g>/g, (full, hex: string) => {
+      return resolveHex(hex) === null ? '' : full;
+    });
+    // Remove standalone paths whose color was marked transparent
+    out = out.replace(/<path\b[^>]*?(?:fill|stroke)="#([0-9a-fA-F]{6})"[^>]*?\/>/g, (full, hex: string) => {
+      return resolveHex(hex) === null ? '' : full;
+    });
+  }
+
   const seen = new Map<string, number>();
-  return svg
-    .replace(/fill="#([0-9a-fA-F]{6})"/g, (full, hex: string) => {
-      const to = mapping.get(`#${hex.toUpperCase()}`);
-      return to ? `fill="${to}"` : full;
+  return out
+    .replace(/(fill|stroke)="#([0-9a-fA-F]{6})"/g, (full, attr: string, hex: string) => {
+      const to = resolveHex(hex);
+      return to ? `${attr}="${to}"` : full;
     })
     .replace(/<g id="color-([0-9A-F]{6})"/g, (_full, hex: string) => {
       // Keep ids unique when several groups now share a color.
-      const to = (mapping.get(`#${hex}`) ?? `#${hex}`).slice(1);
+      const to = (resolveHex(hex) ?? `#${hex}`).slice(1);
       const count = (seen.get(to) ?? 0) + 1;
       seen.set(to, count);
       return `<g id="color-${to}${count > 1 ? `-${count}` : ''}"`;

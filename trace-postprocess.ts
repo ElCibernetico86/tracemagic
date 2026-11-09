@@ -35,6 +35,8 @@ export interface RefineOptions {
   staircase?: boolean;
   /** Snap straight edges within 2° of horizontal/vertical exactly onto it (default true). */
   snapAxes?: boolean;
+  /** Allow snapping closed loops to SVG circular/elliptical arcs (default true). */
+  allowArcs?: boolean;
 }
 
 const round = (n: number) => Math.round(n * 100) / 100;
@@ -1169,7 +1171,14 @@ function detectCorners(pts: Point[], closed: boolean, cornerDeg: number, step: n
   return { corners, big, kSmall, kBig };
 }
 
-function rebuildSubpath(sub: Subpath, maxError: number, cornerDeg: number, outlineSigma: number, snapAxes: boolean): string | null {
+function rebuildSubpath(
+  sub: Subpath,
+  maxError: number,
+  cornerDeg: number,
+  outlineSigma: number,
+  snapAxes: boolean,
+  allowArcs = true,
+): string | null {
   const STEP = 0.5;
   let pts = sub.points;
 
@@ -1180,7 +1189,7 @@ function rebuildSubpath(sub: Subpath, maxError: number, cornerDeg: number, outli
     return d + (sub.closed ? 'Z' : '');
   }
 
-  if (sub.closed) {
+  if (sub.closed && allowArcs) {
     const circle = tryCircleSnap(pts);
     if (circle) return circle;
     const ellipse = tryEllipseSnap(pts);
@@ -1558,7 +1567,14 @@ export function refineTracedSvg(svg: string, options: RefineOptions): string {
           out += polylineD(sub);
           continue;
         }
-        const rebuilt = rebuildSubpath(sub, maxError, cornerDeg, outlineSigma, options.snapAxes ?? true);
+        const rebuilt = rebuildSubpath(
+          sub,
+          maxError,
+          cornerDeg,
+          outlineSigma,
+          options.snapAxes ?? true,
+          options.allowArcs ?? true,
+        );
         out += rebuilt ?? polylineD(sub);
       }
       return tag
